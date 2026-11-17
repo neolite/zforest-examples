@@ -23,6 +23,42 @@ pub fn build(b: *std.Build) void {
     const zmeta_mod = zforest_dep.module("zmeta");
     const db_mod = zforest_dep.module("zdb");
 
+    // Compile-time plugin modules (plugins/*.zig): plain Zig files an
+    // app opts into via named imports (`@import("zplug_markdown")`).
+    // They are NOT dynamically loaded and not auto-included — each app
+    // lists the ones it needs in its module .imports. forest is
+    // injected so plugin node trees share the app's type identity.
+    const plugin_forest_imports = [_]std.Build.Module.Import{
+        .{ .name = "forest", .module = forest_mod },
+    };
+    const html_mod = b.createModule(.{
+        .root_source_file = b.path("plugins/html.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &plugin_forest_imports,
+    });
+    const markdown_imports = [_]std.Build.Module.Import{
+        .{ .name = "forest", .module = forest_mod },
+        .{ .name = "zplug_html", .module = html_mod },
+    };
+    const markdown_mod = b.createModule(.{
+        .root_source_file = b.path("plugins/markdown.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &markdown_imports,
+    });
+    const seo_mod = b.createModule(.{
+        .root_source_file = b.path("plugins/seo.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &plugin_forest_imports,
+    });
+    const rss_mod = b.createModule(.{
+        .root_source_file = b.path("plugins/rss.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const app_imports = [_]std.Build.Module.Import{
         .{ .name = "zefx", .module = zefx_mod },
         .{ .name = "forest", .module = forest_mod },
@@ -131,6 +167,29 @@ pub fn build(b: *std.Build) void {
 
     b.installArtifact(demo);
 
+    // The zblog app: read-only SEO blog — markdown-file CMS + compile-
+    // time plugins under plugins/, file-based routes through zmeta.
+    // No zdb: content is files, not sqlite.
+    const blog_imports = [_]std.Build.Module.Import{
+        .{ .name = "zefx", .module = zefx_mod },
+        .{ .name = "forest", .module = forest_mod },
+        .{ .name = "zserver", .module = zserver_mod },
+        .{ .name = "zmeta", .module = zmeta_mod },
+        .{ .name = "zplug_html", .module = html_mod },
+        .{ .name = "zplug_markdown", .module = markdown_mod },
+        .{ .name = "zplug_seo", .module = seo_mod },
+        .{ .name = "zplug_rss", .module = rss_mod },
+    };
+    const blog_mod = b.createModule(.{
+        .root_source_file = b.path("src/apps/blog/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &blog_imports,
+    });
+    const blog = b.addExecutable(.{ .name = "zblog", .root_module = blog_mod });
+
+    b.installArtifact(blog);
+
     const run_step = b.step("run", "Run the todo server");
     const run_cmd = b.addRunArtifact(exe);
     run_step.dependOn(&run_cmd.step);
@@ -156,6 +215,12 @@ pub fn build(b: *std.Build) void {
     run_demo_step.dependOn(&run_demo_cmd.step);
     run_demo_cmd.step.dependOn(b.getInstallStep());
 
+    const run_blog_step = b.step("run-blog", "Run the zblog SEO blog (args: [port] [bind-ip] [content-dir])");
+    const run_blog_cmd = b.addRunArtifact(blog);
+    run_blog_step.dependOn(&run_blog_cmd.step);
+    run_blog_cmd.step.dependOn(b.getInstallStep());
+    run_blog_cmd.addPassthruArgs();
+
     // App test binaries: each app's main.zig test block pulls in its
     // whole module graph; sqlite is linked into the zforest/zboard
     // test binaries via the shared zdb module.
@@ -174,10 +239,30 @@ pub fn build(b: *std.Build) void {
     const demo_tests = b.addTest(.{ .root_module = demo_mod });
     const run_demo_tests = b.addRunArtifact(demo_tests);
 
+    const blog_tests = b.addTest(.{ .root_module = blog_mod });
+    const run_blog_tests = b.addRunArtifact(blog_tests);
+
+    // Plugin modules are separate Zig modules, so their `test` blocks
+    // do not run inside the app test binaries — each gets its own test
+    // artifact rooted at the plugin file.
+    const html_tests = b.addTest(.{ .root_module = html_mod });
+    const run_html_tests = b.addRunArtifact(html_tests);
+    const markdown_tests = b.addTest(.{ .root_module = markdown_mod });
+    const run_markdown_tests = b.addRunArtifact(markdown_tests);
+    const seo_tests = b.addTest(.{ .root_module = seo_mod });
+    const run_seo_tests = b.addRunArtifact(seo_tests);
+    const rss_tests = b.addTest(.{ .root_module = rss_mod });
+    const run_rss_tests = b.addRunArtifact(rss_tests);
+
     const test_step = b.step("test", "Run app tests");
     test_step.dependOn(&run_exe_tests.step);
     test_step.dependOn(&run_zboard_tests.step);
     test_step.dependOn(&run_zmon_tests.step);
     test_step.dependOn(&run_zcar_tests.step);
     test_step.dependOn(&run_demo_tests.step);
+    test_step.dependOn(&run_blog_tests.step);
+    test_step.dependOn(&run_html_tests.step);
+    test_step.dependOn(&run_markdown_tests.step);
+    test_step.dependOn(&run_seo_tests.step);
+    test_step.dependOn(&run_rss_tests.step);
 }

@@ -1,0 +1,265 @@
+/* zblog — inline critical CSS (emitted once in <head> via HeadSpec.extra).
+   Semantic, readable-first styling; no framework classes. */
+
+*, *::before, *::after { box-sizing: border-box; }
+
+:root {
+    --bg: #fbfaf7;
+    --fg: #1c1b18;
+    --muted: #6b675e;
+    --accent: #0f6fde;
+    --line: #e4e0d8;
+    --card: #ffffff;
+    --code-bg: #f2efe9;
+    --maxw: 46rem;
+}
+
+@media (prefers-color-scheme: dark) {
+    :root {
+        --bg: #171614;
+        --fg: #e8e6e1;
+        --muted: #9a968c;
+        --accent: #6aa8ff;
+        --line: #33312c;
+        --card: #201f1b;
+        --code-bg: #26241f;
+    }
+}
+
+html { font-size: 100%; }
+
+body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--fg);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+        "Helvetica Neue", Arial, sans-serif;
+    line-height: 1.65;
+}
+
+/* ── chrome ─────────────────────────────────────────────── */
+
+.site-header {
+    display: flex;
+    align-items: baseline;
+    gap: 1.5rem;
+    max-width: var(--maxw);
+    margin: 0 auto;
+    padding: 1.25rem 1rem 0.75rem;
+    border-bottom: 1px solid var(--line);
+}
+
+.brand {
+    font-size: 1.4rem;
+    font-weight: 700;
+    color: var(--fg);
+    text-decoration: none;
+}
+
+.site-header nav {
+    display: flex;
+    gap: 1rem;
+}
+
+.nav-link {
+    color: var(--muted);
+    text-decoration: none;
+    font-size: 0.95rem;
+}
+.nav-link:hover { color: var(--accent); }
+
+.site-main {
+    max-width: var(--maxw);
+    margin: 0 auto;
+    padding: 1.5rem 1rem 3rem;
+}
+
+.site-footer {
+    max-width: var(--maxw);
+    margin: 0 auto;
+    padding: 1.5rem 1rem 2.5rem;
+    border-top: 1px solid var(--line);
+    color: var(--muted);
+    font-size: 0.9rem;
+}
+.site-footer p { margin: 0.25rem 0; }
+.footer-links { display: flex; gap: 1rem; }
+
+/* ── typography ────────────────────────────────────────── */
+
+h1 { font-size: 1.9rem; line-height: 1.25; margin: 0.5rem 0 1rem; }
+h2 { font-size: 1.45rem; margin: 1.75rem 0 0.6rem; }
+h3 { font-size: 1.2rem; margin: 1.5rem 0 0.5rem; }
+h4, h5, h6 { font-size: 1.05rem; margin: 1.25rem 0 0.4rem; }
+
+a { color: var(--accent); }
+a:hover { text-decoration: underline; }
+
+p { margin: 0.75rem 0; }
+
+code {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 0.9em;
+    background: var(--code-bg);
+    padding: 0.1em 0.35em;
+    border-radius: 4px;
+}
+
+pre {
+    background: var(--code-bg);
+    padding: 0.9rem 1rem;
+    border-radius: 8px;
+    overflow-x: auto;
+    line-height: 1.5;
+}
+pre code { background: none; padding: 0; font-size: 0.88rem; }
+
+blockquote {
+    margin: 1rem 0;
+    padding: 0.25rem 1rem;
+    border-left: 3px solid var(--line);
+    color: var(--muted);
+}
+
+table {
+    border-collapse: collapse;
+    margin: 1rem 0;
+    width: 100%;
+    font-size: 0.95rem;
+}
+th, td {
+    border: 1px solid var(--line);
+    padding: 0.4rem 0.7rem;
+    text-align: left;
+}
+th { background: var(--code-bg); font-weight: 600; }
+
+img { max-width: 100%; height: auto; border-radius: 6px; }
+
+/* ── post cards ────────────────────────────────────────── */
+
+.post-list { display: flex; flex-direction: column; gap: 1.25rem; }
+
+article.post {
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    padding: 1.1rem 1.25rem;
+}
+article.post h2 { margin-top: 0; }
+article.post h2 a { color: var(--fg); text-decoration: none; }
+article.post h2 a:hover { color: var(--accent); }
+
+.post .meta, .post-full .meta {
+    color: var(--muted);
+    font-size: 0.88rem;
+    margin: 0.3rem 0 0.6rem;
+}
+.post .excerpt { color: var(--fg); margin-bottom: 0.4rem; }
+
+.tag {
+    display: inline-block;
+    font-size: 0.8rem;
+    color: var(--accent);
+    text-decoration: none;
+    border: 1px solid var(--line);
+    border-radius: 999px;
+    padding: 0.05rem 0.55rem;
+    margin: 0 0.15rem;
+}
+.tag:hover { border-color: var(--accent); }
+
+.empty { color: var(--muted); font-style: italic; }
+
+/* ── search + pagination ───────────────────────────────── */
+
+.search-form {
+    display: flex;
+    gap: 0.5rem;
+    margin: 0.75rem 0 1.5rem;
+}
+.search-form input[type="search"] {
+    flex: 1;
+    padding: 0.5rem 0.75rem;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    background: var(--card);
+    color: var(--fg);
+    font: inherit;
+}
+.search-form button {
+    padding: 0.5rem 1rem;
+    border: 1px solid var(--accent);
+    border-radius: 8px;
+    background: var(--accent);
+    color: #fff;
+    font: inherit;
+    cursor: pointer;
+}
+
+.pagination {
+    display: flex;
+    align-items: center;
+    gap: 1rem;
+    margin-top: 2rem;
+    padding-top: 1rem;
+    border-top: 1px solid var(--line);
+}
+.pagination .page-pos { color: var(--muted); font-size: 0.9rem; }
+
+/* ── full post ─────────────────────────────────────────── */
+
+.post-page .post-full {
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    padding: 1.5rem 1.75rem;
+}
+.post-full header h1 { margin-bottom: 0.4rem; }
+
+.post-body { margin-top: 1rem; }
+.post-body > *:first-child { margin-top: 0; }
+.post-body > *:last-child { margin-bottom: 0; }
+
+.post-full footer .tags { margin-top: 1.5rem; padding-top: 1rem; border-top: 1px solid var(--line); }
+
+/* TOC — <details> keeps it JS-free. */
+nav.toc {
+    margin: 1rem 0;
+    padding: 0.6rem 1rem;
+    background: var(--code-bg);
+    border-radius: 8px;
+    font-size: 0.92rem;
+}
+nav.toc summary { cursor: pointer; font-weight: 600; }
+nav.toc ul { margin: 0.5rem 0 0.25rem; padding-left: 1.25rem; }
+nav.toc li.lv3 { margin-left: 1rem; }
+nav.toc li.lv4, nav.toc li.lv5, nav.toc li.lv6 { margin-left: 2rem; font-size: 0.9em; }
+
+/* ── breadcrumb ────────────────────────────────────────── */
+
+nav[aria-label="breadcrumb"] {
+    font-size: 0.88rem;
+    color: var(--muted);
+    margin-bottom: 0.75rem;
+}
+nav[aria-label="breadcrumb"] ol {
+    list-style: none;
+    display: flex;
+    gap: 0.5rem;
+    margin: 0;
+    padding: 0;
+}
+nav[aria-label="breadcrumb"] li.current { color: var(--fg); }
+
+/* ── misc ──────────────────────────────────────────────── */
+
+.post-body hr { border: none; border-top: 1px solid var(--line); margin: 1.5rem 0; }
+.post-body ul, .post-body ol { padding-left: 1.5rem; }
+.post-body li { margin: 0.25rem 0; }
+.post-body img { margin: 0.75rem 0; }
+
+@media (max-width: 40rem) {
+    .site-header { flex-direction: column; gap: 0.5rem; }
+    .post-full { padding: 1rem; }
+}

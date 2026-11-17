@@ -18,7 +18,14 @@
   - FSD layer dirs as needed: `entities/`, `features/`, `shared/`
 - Apps: `todo` (exe `zforest`, sqlite via `zdb`), `board` (exe `zboard`,
   sqlite via `zdb`), `mon` (exe `zmon`, live bindings, libc), `car`
-  (exe `zcar`), `zmeta_demo` (exe `zmeta-demo`).
+  (exe `zcar`), `zmeta_demo` (exe `zmeta-demo`), `blog` (exe `zblog`,
+  read-only markdown CMS + SEO, no sqlite).
+- `plugins/*.zig` — compile-time Zig plugin modules (`html`,
+  `markdown`, `seo`, `rss`) imported by apps as named modules
+  (`zplug_*`); declared via `createModule` in `build.zig` with
+  `forest` injected for type identity. Each plugin gets its own
+  `addTest` target — plugin-module `test` blocks do not run inside
+  app test binaries.
 - `build.zig` — consumes the framework via `b.dependency("zforest")`
   and `dep.module("zefx"|"forest"|"zserver"|"zmeta"|"zdb")`; each app
   gets a `createModule` rooted at its `main.zig`. `gen`/`new-app`
@@ -38,10 +45,13 @@
 ## Build, Test, and Development Commands
 
 - `zig build`: compile and install the executables (`zforest`, `zboard`,
-  `zmon`, `zcar`, `zmeta-demo`) — requires `../zforest` checked out.
-- `zig build run` / `run-board` / `run-mon` / `run-car` / `run-demo`:
-  run an app (args pass through to the exe).
-- `zig build test`: run the five app test targets.
+  `zmon`, `zcar`, `zmeta-demo`, `zblog`) — requires `../zforest`
+  checked out.
+- `zig build run` / `run-board` / `run-mon` / `run-car` / `run-demo` /
+  `run-blog`: run an app (args pass through to the exe; `zblog` takes
+  `[port] [bind-ip] [content-dir]`).
+- `zig build test`: run the six app test targets plus one per plugin
+  module under `plugins/`.
 - `zig build gen`: regenerate `src/apps/*/gen/*.zig` (idempotent).
 - `zig build new-app -- <name>`: scaffold `src/apps/<name>/` then regen.
 - `zig fmt src/**/*.zig build.zig`: format before committing.

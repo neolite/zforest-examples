@@ -6,7 +6,7 @@ a fine-grained DOM patch layer, served by a minimal `std.http` server
 with a vanilla JS patch client. This repo holds the apps; the framework
 itself lives in the sibling `zforest` repo.
 
-Five apps share the transport:
+Six apps share the transport:
 
 - **`zforest`** — the Todo demo (per-session view state; todos persist
   to SQLite keyed by a `ztd` client cookie).
@@ -25,6 +25,10 @@ Five apps share the transport:
 - **`zmeta-demo`** — the `zmeta` meta-framework demo: file-based
   routes, typed params, generated action dispatch, `Session(Deps)`
   skeleton.
+- **`zblog`** — a read-only, SEO-focused blog: Markdown files are the
+  CMS (no database), file-based routes, RSS/sitemap/robots raw
+  endpoints, and per-page `<head>` metadata (canonical, Open Graph,
+  JSON-LD) via reusable compile-time Zig plugins in `plugins/`.
 
 ## Dependency on zforest
 
@@ -48,18 +52,20 @@ the framework stabilizes its package layout.
 ## Run
 
 ```sh
-zig build        # produces zig-out/bin/{zforest,zboard,zmon,zcar,zmeta-demo}
+zig build        # produces zig-out/bin/{zforest,zboard,zmon,zcar,zmeta-demo,zblog}
 zig build run    # serves the todo app on http://127.0.0.1:8080
 zig build run-board 8081 127.0.0.1 board.db  # board on :8081, file db
 zig build run-mon 8082 127.0.0.1             # dashboard on :8082
 zig build run-car 8083 127.0.0.1             # booking demo on :8083
 zig build run-demo 8084 127.0.0.1            # zmeta demo on :8084
+zig build run-blog 8085 127.0.0.1            # blog on :8085
 ./zig-out/bin/zforest [port] [bind-ip] [db-path]  # db-path default "zforest-todos.db"
 ./zig-out/bin/zboard   [port] [bind-ip] [db-path]   # db-path default ":memory:"
 ./zig-out/bin/zmon     [port] [bind-ip]
 ./zig-out/bin/zcar     [port] [bind-ip]
 ./zig-out/bin/zmeta-demo [port] [bind-ip]
-zig build test   # all app test targets
+./zig-out/bin/zblog    [port] [bind-ip] [content-dir]  # content-dir default "src/apps/blog/content"
+zig build test   # all app + plugin test targets
 ```
 
 ## Apps
@@ -112,11 +118,54 @@ rows on first contact. `src/apps/todo/store.zig` holds the `TodoStore`
 (schema + prepared statements); `zdb` (from the framework) is the shared
 sqlite wrapper.
 
+### zblog
+
+A read-only blog whose content is **Markdown files, not a database**:
+`src/apps/blog/content/posts/*.md` and `.../pages/*.md` carry a small
+YAML-subset frontmatter (`title`, `date`, `author`, `tags`,
+`description`, `slug`, `draft`) parsed by `src/apps/blog/content.zig`.
+Drafts are skipped at load; posts sort by date descending.
+
+- Routes (file-based, generated): `/` (paginated index + `?q=` search
+  + `?page=`), `/post/<slug>`, `/tag/<tag>`, `/about`, plus raw
+  endpoints `/rss.xml`, `/sitemap.xml`, `/robots.txt`.
+- Every page declares a `HeadSpec` via its `head()` hook: canonical
+  URL, meta description, Open Graph (`website`/`article`), Twitter
+  card, pagination `rel=prev/next`, and JSON-LD (`Blog`,
+  `BlogPosting`, `WebPage`, `Person`, `Organization`).
+- Post pages render semantic HTML (`<article>`, `<time
+  datetime>`, heading `id`s, TOC via `<details>` when ≥2 headings,
+  tag links) — no client-side JS.
+- Russian sample content lives in `src/apps/blog/content/`; the
+  canonical site URL is the `site_url` constant in
+  `src/apps/blog/app.zig` (`https://blog.example.com` placeholder).
+
+#### Compile-time plugins (`plugins/`)
+
+Reusable Zig modules an app opts into via named module imports —
+**not** dynamically loaded:
+
+| Module | Import as | Provides |
+|---|---|---|
+| `plugins/html.zig` | `zplug_html` | Escaped raw-element helpers for tags `forest.Tag` lacks (`article`, `nav`, `header`, `time`, `ol`, `del`, `h4`–`h6`) |
+| `plugins/markdown.zig` | `zplug_markdown` | Markdown→`forest.Node` renderer (headings+ids, lists, tables, fences, quotes, strikethrough, Cyrillic slugify) + `headings()` TOC data |
+| `plugins/seo.zig` | `zplug_seo` | Escaped meta/link tag strings, Open Graph blocks, script-safe JSON-LD serializer |
+| `plugins/rss.zig` | `zplug_rss` | RSS 2.0 channel/item rendering, XML escaping, RFC-822 dates |
+
+`build.zig` declares each as a `createModule` (with `forest` injected
+for type identity) and lists them in the blog module's `.imports`;
+each plugin also gets its own `zig build test` target since plugin
+modules' `test` blocks don't run inside app test binaries.
+
+See [docs/adr/0002-blog-seo-and-plugins.md](docs/adr/0002-blog-seo-and-plugins.md)
+for the design rationale.
+
 ### zmeta apps
 
-`zboard`, `zmon`, `zcar`, and `zmeta-demo` are all `zmeta` apps:
-file-based routes under `pages/`, an `actions.zig` manifest, generated
-`gen/routes.zig` + `gen/actions.zig`, and a `Session(Deps)` skeleton.
+`zboard`, `zmon`, `zcar`, `zmeta-demo`, and `zblog` are all `zmeta`
+apps: file-based routes under `pages/`, an `actions.zig` manifest,
+generated `gen/routes.zig` + `gen/actions.zig`, and a
+`Session(Deps)` skeleton.
 
 ```sh
 zig build gen        # regenerate src/apps/*/gen/*.zig (idempotent, checked in)
