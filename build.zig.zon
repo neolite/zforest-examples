@@ -1,0 +1,19 @@
+.{
+    .name = .zforest_examples,
+    .version = "0.1.0",
+    .fingerprint = 0x3cc1d7e2a4ab5f8c,
+    .minimum_zig_version = "0.17.1",
+    .dependencies = .{
+        .zforest = .{ .path = "../zforest" },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "docs",
+        "README.md",
+        "AGENTS.md",
+        "LICENSE",
+        ".gitignore",
+    },
+}
