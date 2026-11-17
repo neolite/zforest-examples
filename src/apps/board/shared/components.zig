@@ -443,11 +443,15 @@ pub fn authPage(a: std.mem.Allocator, env: ViewEnv, title: []const u8, action_na
     var fkids: std.ArrayListUnmanaged(forest.Node) = .empty;
     for (fields) |f| fkids.append(a, f) catch @panic("OOM");
     fkids.append(a, forest.el(a, .button, .{ .type = "submit", .class = "auth-submit" }, submit_label)) catch @panic("OOM");
-    kids.append(a, forest.el(a, .form, .{
+    const form = forest.el(a, .form, .{
         .class = "auth-form",
         .autocomplete = "off",
         .on = .{ .submit = action_name },
-    }, fkids.toOwnedSlice(a) catch @panic("OOM"))) catch @panic("OOM");
+    }, fkids.toOwnedSlice(a) catch @panic("OOM"));
+    // The form itself is auth-dependent too: a logged-in viewer gets the
+    // note + links only — `when` so a clone-fork login/logout swaps it
+    // structurally instead of leaving a stale submittable form.
+    kids.append(a, forest.when(a, .{ .id = "w-auth-form" }, env.account_id == null, form)) catch @panic("OOM");
     kids.append(a, forest.el(a, .p, .{ .class = "auth-links" }, .{
         forest.el(a, .a, .{ .href = other.href }, other.label),
         forest.text(" · "),
