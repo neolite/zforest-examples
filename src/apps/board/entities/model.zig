@@ -26,10 +26,18 @@ pub const latest_home_count = 10;
 /// Tripcode input cap (chars, after trimming) — 4chan-style `!code`
 /// suffixes are short; the cap keeps the HMAC input bounded.
 pub const max_trip_len = 64;
+/// Comment nesting cap — chain length INCLUDING the top-level comment
+/// (a top-level comment is depth 1). `commentNode` and the forest
+/// serialize/diff walks recurse once per level, so an unbounded chain
+/// would exhaust the worker stack; 32 levels is already far beyond
+/// usable thread UI. Enforced at insert in `addComment` — chains
+/// persisted before the cap existed are trusted as-is.
+pub const max_comment_depth = 32;
 
 // Account constants + row type live in accounts.zig — re-exported so
 // `model.password_salt_len`, `model.Account`, etc. keep resolving.
 pub const max_account_name_len = accounts.max_account_name_len;
+pub const max_account_email_len = accounts.max_account_email_len;
 pub const min_password_len = accounts.min_password_len;
 pub const password_salt_len = accounts.password_salt_len;
 pub const Account = accounts.Account;
@@ -93,6 +101,9 @@ pub const ModelError = error{
     PostNotFound,
     CommentNotFound,
     ParentNotFound,
+    TooDeep,
+    InvalidEmail,
+    EmailTaken,
     Sqlite,
     OutOfMemory,
     Closed,
@@ -242,6 +253,7 @@ const schema =
     \\CREATE TABLE IF NOT EXISTS accounts (
     \\    id INTEGER PRIMARY KEY,
     \\    name TEXT UNIQUE NOT NULL,
+    \\    email TEXT,
     \\    pass_hash TEXT NOT NULL,
     \\    auth_token TEXT,
     \\    created INTEGER NOT NULL
@@ -287,6 +299,10 @@ pub const BoardModel = struct {
     accounts: std.ArrayListUnmanaged(Account) = .empty,
     account_by_name: std.StringHashMapUnmanaged(usize) = .empty,
     account_by_token: std.StringHashMapUnmanaged(usize) = .empty,
+    /// Lowercased-email → account index (accounts without an email —
+    /// pre-email rows — are absent). Keys borrow `Account.email`,
+    /// same ownership rule as `account_by_name`.
+    account_by_email: std.StringHashMapUnmanaged(usize) = .empty,
     /// post id -> comment count, maintained on load/addComment so
     /// `commentCount` is O(1) instead of a full scan per post card.
     post_counts: std.AutoHashMapUnmanaged(u64, u32) = .empty,
@@ -422,16 +438,17 @@ pub const BoardModel = struct {
     }
 
     /// Minimal forward-migration for pre-account databases: add the
-    /// `trip`/`acct` columns to posts/comments when missing. Fresh
-    /// databases already have them from `schema` — the pragma probe
-    /// makes this a no-op there. `accounts` needs no migration: it's
-    /// CREATE TABLE IF NOT EXISTS.
+    /// `trip`/`acct`/`email` columns when missing. Fresh databases
+    /// already have them from `schema` — the pragma probe makes this
+    /// a no-op there; the `accounts_email` unique index is (re)created
+    /// unconditionally since it's cheap and idempotent.
     fn migrate(self: *BoardModel) !void {
         const adds = [_]struct { table: []const u8, col: []const u8, ddl: []const u8 }{
             .{ .table = "posts", .col = "trip", .ddl = "TEXT" },
             .{ .table = "comments", .col = "trip", .ddl = "TEXT" },
             .{ .table = "posts", .col = "acct", .ddl = "INTEGER" },
             .{ .table = "comments", .col = "acct", .ddl = "INTEGER" },
+            .{ .table = "accounts", .col = "email", .ddl = "TEXT" },
         };
         for (adds) |a| {
             if (try self.hasColumn(a.table, a.col)) continue;
@@ -439,6 +456,12 @@ pub const BoardModel = struct {
             const sql = std.fmt.bufPrint(&sql_buf, "ALTER TABLE {s} ADD COLUMN {s} {s}", .{ a.table, a.col, a.ddl }) catch unreachable;
             try self.db.exec(self.gpa, sql);
         }
+        // Email uniqueness backstop (the app-level `account_by_email`
+        // check produces EmailTaken first): a named UNIQUE index works
+        // for fresh AND migrated dbs — NULL emails stay distinct, and
+        // stored values are already lowercased so the index is
+        // effectively case-insensitive. Idempotent every init.
+        try self.db.exec(self.gpa, "CREATE UNIQUE INDEX IF NOT EXISTS accounts_email ON accounts(email)");
     }
 
     /// Load all rows; names are assigned by user row order so they are
@@ -595,19 +618,23 @@ pub const BoardModel = struct {
         return accounts.accountByAuthToken(self, token);
     }
 
-    /// Register `name`/`password` and attach `auth_token` in one step
-    /// (register == auto-login). `salt` is caller-minted randomness —
-    /// the model stays io-free like `ensureUser`. Returns the new id.
-    /// Auth writes do NOT bump `global_seq`: nothing any other session
-    /// renders depends on the accounts table.
-    pub fn registerAccount(self: *BoardModel, name_in: []const u8, password: []const u8, salt: *const [password_salt_len]u8, auth_token: []const u8) ModelError!u64 {
-        return accounts.registerAccount(self, name_in, password, salt, auth_token);
+    /// Register `name`/`email`/`password` and attach `auth_token` in
+    /// one step (register == auto-login). `salt` is caller-minted
+    /// randomness — the model stays io-free like `ensureUser`.
+    /// Returns the new id. Auth writes do NOT bump `global_seq`:
+    /// nothing any other session renders depends on the accounts table.
+    pub fn registerAccount(self: *BoardModel, name_in: []const u8, email_in: []const u8, password: []const u8, salt: *const [password_salt_len]u8, auth_token: []const u8) ModelError!u64 {
+        return accounts.registerAccount(self, name_in, email_in, password, salt, auth_token);
     }
 
-    /// Verify `name`/`password`; returns the account id. Unknown name
-    /// and wrong password share `error.BadLogin` — no user enumeration.
-    pub fn verifyAccount(self: *const BoardModel, name: []const u8, password: []const u8) ModelError!u64 {
-        return accounts.verifyAccount(self, name, password);
+    /// Verify `identifier`/`password`; returns the account id.
+    /// `identifier` is the login field: an email (contains '@' —
+    /// looked up lowercased in `account_by_email`) or, for accounts
+    /// registered before email existed (`email == null`), the account
+    /// name. Unknown identifier and wrong password share
+    /// `error.BadLogin` — no user enumeration.
+    pub fn verifyAccount(self: *const BoardModel, identifier: []const u8, password: []const u8) ModelError!u64 {
+        return accounts.verifyAccount(self, identifier, password);
     }
 
     /// (Re)bind account `id`'s live auth token — login mints a fresh
@@ -846,6 +873,19 @@ pub const BoardModel = struct {
         if (parent_id) |pid| {
             const pi = self.findComment(pid) orelse return error.ParentNotFound;
             if (self.comments.items[pi].post != post_id) return error.ParentNotFound;
+            // Depth cap: the new comment's chain length is 1 (itself)
+            // plus its parent's — walk the parent links counting.
+            // Existing chains are already ≤ max_comment_depth (the cap
+            // held at their insert), so the walk is bounded; a dangling
+            // parent (corrupt db) just stops the count early.
+            var depth: usize = 2;
+            var cur = self.comments.items[pi].parent;
+            while (cur) |cid| {
+                depth += 1;
+                if (depth > max_comment_depth) return error.TooDeep;
+                const ci = self.findComment(cid) orelse break;
+                cur = self.comments.items[ci].parent;
+            }
         }
         const tripcode = try normalizeTrip(trip_in);
         const trip_hash = if (tripcode) |tc| try tripHashHex(self.gpa, user_token, tc) else null;
@@ -956,6 +996,16 @@ pub const BoardModel = struct {
         if (row_acct != caller) return error.NotFound;
         const bi = boardIndex(p.board);
 
+        // The whole DB cascade runs in ONE transaction: the statements
+        // below are independent DELETEs, and a mid-cascade failure must
+        // not leave committed rows the in-memory model never saw (the
+        // memory update only runs after COMMIT). `committed` gates the
+        // errdefer rollback — a failed COMMIT still leaves the txn
+        // open, so rolling back is correct there too.
+        self.db.exec(self.gpa, "BEGIN") catch |e| return dbErr(e);
+        var committed = false;
+        errdefer if (!committed) self.db.exec(self.gpa, "ROLLBACK") catch {};
+
         // Likes first: the comment-id subquery must run before the
         // comments rows are gone.
         var st = self.db.prepare(self.gpa, "DELETE FROM likes WHERE (kind = 'p' AND target = ?) OR (kind = 'c' AND target IN (SELECT id FROM comments WHERE post = ?))") catch |e| return dbErr(e);
@@ -971,6 +1021,8 @@ pub const BoardModel = struct {
         defer stp.finalize();
         stp.bindInt(1, @intCast(id)) catch |e| return dbErr(e);
         _ = stp.step() catch |e| return dbErr(e);
+        self.db.exec(self.gpa, "COMMIT") catch |e| return dbErr(e);
+        committed = true;
 
         // In-memory: drop every comment of the post (backwards so
         // orderedRemove indices stay valid), then the post itself.
@@ -1020,6 +1072,12 @@ pub const BoardModel = struct {
             stack.deinit(self.gpa);
         }
 
+        // Same single-transaction rule as deletePost: likes + comment
+        // rows commit together or not at all; memory updates after.
+        self.db.exec(self.gpa, "BEGIN") catch |e| return dbErr(e);
+        var committed = false;
+        errdefer if (!committed) self.db.exec(self.gpa, "ROLLBACK") catch {};
+
         // Likes on every doomed comment, then the comment rows.
         var st = self.db.prepare(self.gpa, "DELETE FROM likes WHERE kind = 'c' AND target = ?") catch |e| return dbErr(e);
         defer st.finalize();
@@ -1035,6 +1093,8 @@ pub const BoardModel = struct {
             stc.bindInt(1, @intCast(did)) catch |e| return dbErr(e);
             _ = stc.step() catch |e| return dbErr(e);
         }
+        self.db.exec(self.gpa, "COMMIT") catch |e| return dbErr(e);
+        committed = true;
 
         var i = self.comments.items.len;
         while (i > 0) {
@@ -1501,9 +1561,9 @@ test "board model: deletePost cascades comments and likes; ownership-gated" {
     _ = try m.ensureUser("tok-a");
     _ = try m.ensureUser("tok-b");
     var salt: [password_salt_len]u8 = @splat(0x11);
-    const aid = try m.registerAccount("alice", "password1", &salt, "tok-auth");
+    const aid = try m.registerAccount("alice", "alice@x.z", "password1", &salt, "tok-auth");
     var salt2: [password_salt_len]u8 = @splat(0x22);
-    const bid = try m.registerAccount("bob", "password2", &salt2, "tok-auth2");
+    const bid = try m.registerAccount("bob", "bob@x.z", "password2", &salt2, "tok-auth2");
 
     const p_owned = try m.addPost("b", "tok-a", "my post", null, aid);
     const p_other = try m.addPost("b", "tok-b", "not mine", null, null);
@@ -1559,9 +1619,9 @@ test "board model: deleteComment cascades the reply subtree and likes" {
     _ = try m.ensureUser("tok-a");
     _ = try m.ensureUser("tok-b");
     var salt: [password_salt_len]u8 = @splat(0x44);
-    const aid = try m.registerAccount("alice", "password1", &salt, "tok-auth");
+    const aid = try m.registerAccount("alice", "alice@x.z", "password1", &salt, "tok-auth");
     var salt2: [password_salt_len]u8 = @splat(0x55);
-    const bid = try m.registerAccount("bob", "password2", &salt2, "tok-auth2");
+    const bid = try m.registerAccount("bob", "bob@x.z", "password2", &salt2, "tok-auth2");
 
     const p = try m.addPost("b", "tok-a", "post", null, aid);
     // Tree: c1 (acct) → c2 (anon) → c3 (acct reply to c2); c4 sibling.
@@ -1609,4 +1669,127 @@ test "board model: deleteComment cascades the reply subtree and likes" {
     const kids4 = try m.childIdx(alloc, c4.id);
     defer alloc.free(kids4);
     try std.testing.expectEqual(@as(usize, 0), kids4.len);
+}
+
+test "board model: comment chains are capped at max_comment_depth" {
+    const alloc = std.testing.allocator;
+    var m = try BoardModel.init(alloc, ":memory:");
+    defer m.deinit();
+    _ = try m.ensureUser("tok-deep");
+    const p = try m.addPost("b", "tok-deep", "deep thread", null, null);
+
+    // Build a chain to exactly the cap: top-level = depth 1, each
+    // reply +1 — max_comment_depth comments total.
+    var prev = try m.addComment(p.id, null, "tok-deep", "level 1", null, null);
+    var level: usize = 1;
+    while (level < max_comment_depth) : (level += 1) {
+        prev = try m.addComment(p.id, prev.id, "tok-deep", "deeper", null, null);
+    }
+    try std.testing.expectEqual(@as(usize, max_comment_depth), m.comments.items.len);
+
+    // One more reply would exceed the cap — rejected before any write.
+    const seq = m.global_seq.load(.seq_cst);
+    try std.testing.expectError(error.TooDeep, m.addComment(p.id, prev.id, "tok-deep", "too deep", null, null));
+    try std.testing.expectEqual(@as(usize, max_comment_depth), m.comments.items.len);
+    try std.testing.expectEqual(seq, m.global_seq.load(.seq_cst));
+
+    // A fresh top-level comment is unaffected by the deep chain.
+    _ = try m.addComment(p.id, null, "tok-deep", "new root", null, null);
+    try std.testing.expectEqual(@as(usize, max_comment_depth + 1), m.comments.items.len);
+}
+
+test "board model: migrates a pre-email accounts table; email index enforces uniqueness" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    const t = try tmpDbPaths(alloc, "emailmig");
+    defer t.deinit(alloc);
+    cleanTmpDb(io, t);
+    defer cleanTmpDb(io, t);
+
+    {
+        // Pre-email schema: accounts without the email column + a
+        // legacy account row (NULL-able equivalent: column absent).
+        var d = try db.Db.open(alloc, t.path);
+        defer d.close();
+        try d.exec(alloc,
+            \\CREATE TABLE users (
+            \\    token TEXT PRIMARY KEY,
+            \\    created INTEGER NOT NULL
+            \\);
+            \\CREATE TABLE posts (
+            \\    id INTEGER PRIMARY KEY,
+            \\    board TEXT NOT NULL,
+            \\    user TEXT NOT NULL,
+            \\    text TEXT NOT NULL,
+            \\    ts INTEGER NOT NULL,
+            \\    trip TEXT,
+            \\    acct INTEGER
+            \\);
+            \\CREATE TABLE comments (
+            \\    id INTEGER PRIMARY KEY,
+            \\    post INTEGER NOT NULL,
+            \\    parent INTEGER,
+            \\    user TEXT NOT NULL,
+            \\    text TEXT NOT NULL,
+            \\    ts INTEGER NOT NULL,
+            \\    trip TEXT,
+            \\    acct INTEGER
+            \\);
+            \\CREATE TABLE accounts (
+            \\    id INTEGER PRIMARY KEY,
+            \\    name TEXT UNIQUE NOT NULL,
+            \\    pass_hash TEXT NOT NULL,
+            \\    auth_token TEXT,
+            \\    created INTEGER NOT NULL
+            \\);
+            \\CREATE TABLE likes (
+            \\    kind TEXT NOT NULL,
+            \\    target INTEGER NOT NULL,
+            \\    user TEXT NOT NULL,
+            \\    ts INTEGER NOT NULL,
+            \\    PRIMARY KEY (kind, target, user)
+            \\);
+        );
+        // A real pass_hash so verifyAccount can check it post-migration.
+        var m0 = try BoardModel.init(alloc, ":memory:");
+        defer m0.deinit();
+        var salt: [password_salt_len]u8 = @splat(0x77);
+        _ = try m0.registerAccount("legacy", "legacy@x.z", "password1", &salt, "tok-legacy");
+        const legacy_hash = try alloc.dupe(u8, m0.accounts.items[0].pass_hash);
+        defer alloc.free(legacy_hash);
+        var ins = try d.prepare(alloc, "INSERT INTO accounts (id, name, pass_hash, auth_token, created) VALUES (1, 'legacy', ?, 'tok-legacy', 1)");
+        defer ins.finalize();
+        ins.bindText(1, legacy_hash) catch return error.TestUnexpectedResult;
+        _ = try ins.step();
+    }
+    {
+        var m = try BoardModel.init(alloc, t.path);
+        defer m.deinit();
+        // The email column was added; the legacy row loads with NULL.
+        try std.testing.expectEqual(@as(usize, 1), m.accounts.items.len);
+        try std.testing.expect(m.accounts.items[0].email == null);
+        try std.testing.expect(m.account_by_email.count() == 0);
+        // Legacy name login still works for email-less accounts.
+        try std.testing.expectEqual(@as(u64, 1), try m.verifyAccount("legacy", "password1"));
+        // New registrations carry emails; the unique index + map agree.
+        var salt: [password_salt_len]u8 = @splat(0x78);
+        const id = try m.registerAccount("newbie", "New@X.Z", "password2", &salt, "tok-new");
+        try std.testing.expectEqual(@as(u64, 2), id);
+        try std.testing.expectEqualStrings("new@x.z", m.accounts.items[1].email.?);
+        try std.testing.expectEqual(@as(?usize, 1), m.account_by_email.get("new@x.z"));
+        try std.testing.expectError(error.EmailTaken, m.registerAccount("other", "NEW@x.z", "password3", &salt, "tok-o"));
+        // Login by email, case-insensitive on the stored lowercase.
+        try std.testing.expectEqual(@as(u64, 2), try m.verifyAccount("New@X.Z", "password2"));
+        try std.testing.expectError(error.BadLogin, m.verifyAccount("newbie", "password2")); // name login needs email == null
+    }
+    {
+        // Reopen: email + index + lowercase storage all persisted.
+        var m = try BoardModel.init(alloc, t.path);
+        defer m.deinit();
+        var salt3: [password_salt_len]u8 = @splat(0x99);
+        try std.testing.expectEqual(@as(usize, 2), m.accounts.items.len);
+        try std.testing.expectEqualStrings("new@x.z", m.accounts.items[1].email.?);
+        try std.testing.expectEqual(@as(?usize, 1), m.account_by_email.get("new@x.z"));
+        try std.testing.expectError(error.EmailTaken, m.registerAccount("third", "new@x.z", "password4", &salt3, "tok-t"));
+    }
 }

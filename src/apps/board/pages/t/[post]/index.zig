@@ -20,12 +20,20 @@ pub fn view(a: std.mem.Allocator, s: anytype, p: params, env: *const zmeta.Env) 
     _ = env;
     const venv = s.deps.viewEnv();
     const mm = model.get();
-    const post = mm.post(p.post) orelse {
-        return components.notFoundView(a, "Тред не найден.");
-    };
+    // The whole page sits behind a `variant` boundary: `prepare` 404s a
+    // dangling id on the initial GET, but a post deleted WHILE a viewer
+    // is on the page must swap the live DOM to not-found content. A
+    // plain early return can't replace the previously rendered branch —
+    // the `z-when:w-thread` anchors let the diff ship one idempotent
+    // `when` op ("thread" ↔ "missing").
+    const post = mm.post(p.post);
+    if (post == null) {
+        return forest.variant(a, .{ .id = "w-thread" }, "missing", components.notFoundView(a, "Тред не найден."));
+    }
+    const pt = post.?;
     var kids: std.ArrayListUnmanaged(forest.Node) = .empty;
-    kids.append(a, components.crumbsView(a, post, &[_]u64{})) catch @panic("OOM");
-    kids.append(a, components.postCard(a, venv, post, false)) catch @panic("OOM");
+    kids.append(a, components.crumbsView(a, pt, &[_]u64{})) catch @panic("OOM");
+    kids.append(a, components.postCard(a, venv, pt, false)) catch @panic("OOM");
     kids.append(a, components.commentForm(a, venv, p.post, null)) catch @panic("OOM");
 
     const tops = mm.topCommentIdx(a, p.post) catch @panic("OOM");
@@ -38,5 +46,5 @@ pub fn view(a: std.mem.Allocator, s: anytype, p: params, env: *const zmeta.Env) 
     kids.append(a, components.sortBar(a, venv.sort)) catch @panic("OOM");
     kids.append(a, forest.el(a, .ul, .{ .id = "comments", .class = "comments" }, forest.each(ck.toOwnedSlice(a) catch @panic("OOM")))) catch @panic("OOM");
     kids.append(a, forest.when(a, .{ .id = "w-comments-empty" }, tops.len == 0, forest.el(a, .p, .{ .class = "empty" }, "Нет комментариев — будь первым."))) catch @panic("OOM");
-    return forest.fragment(a, kids.toOwnedSlice(a) catch @panic("OOM"));
+    return forest.variant(a, .{ .id = "w-thread" }, "thread", forest.fragment(a, kids.toOwnedSlice(a) catch @panic("OOM")));
 }

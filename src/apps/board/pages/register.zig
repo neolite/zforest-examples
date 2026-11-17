@@ -1,6 +1,7 @@
-//! "/register" — account creation (ADR-0001 phase 2). Static route,
-//! no params, no prepare gate; the form posts the `register` action
-//! (register == auto-login).
+//! "/register" — account creation (ADR-0001 phase 2 + email auth).
+//! Static route, no params, no prepare gate; the form posts the
+//! `register` action (register == auto-login). Email is the login
+//! identifier — stored lowercased, unique case-insensitively.
 const std = @import("std");
 const forest = @import("forest");
 const zmeta = @import("../zmeta.zig");
@@ -15,6 +16,7 @@ pub fn view(a: std.mem.Allocator, s: anytype, p: params, env: *const zmeta.Env) 
     const venv = s.deps.viewEnv();
     const fields = [_]forest.Node{
         components.authField(a, "name", "text", "имя (1–32: a-z 0-9 _ -)", "username"),
+        components.authField(a, "email", "email", "email", "email"),
         components.authField(a, "password", "password", "пароль (мин. 8)", "new-password"),
         components.authField(a, "confirm", "password", "пароль ещё раз", "new-password"),
     };

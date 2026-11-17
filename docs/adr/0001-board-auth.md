@@ -79,3 +79,29 @@ Ship auth in two phases:
 - PBKDF2 iteration count is a demo-grade trade-off; if zboard ever
   holds real accounts, swap the KDF — the `pass_hash` column format
   (`salt$iterations$hash`) leaves room.
+
+## Addendum: email as the login identifier
+
+Phase 2 shipped name+password login; the identifier is now **email**:
+
+- `accounts` gained a nullable `email TEXT` column (same
+  `PRAGMA`-guarded `ALTER TABLE` migration) plus a
+  `CREATE UNIQUE INDEX IF NOT EXISTS accounts_email`. Emails are
+  trimmed, validated minimally (3–254 chars, contains `@`, no
+  whitespace — the value is a login key, never used to send mail) and
+  **stored lowercased**, so the unique index is effectively
+  case-insensitive and `account_by_email` lookups need no folding.
+- `verifyAccount` takes a single `identifier`: containing `@` → email
+  lookup (case-insensitive); otherwise → name lookup **only for
+  accounts with `email == null`** — rows migrated from pre-email
+  databases keep name login, while the name of an email account is
+  display-only (`@name` on posts). Unknown identifier and wrong
+  password still share `BadLogin` (no enumeration).
+- Register form gained an `email` field; login's `name` field became
+  `email` (`type="email"`). Display name, ownership (`acct`), group
+  keys and cookies are unchanged — email is purely the credential
+  lookup key.
+- Migration: existing databases get `email` added with NULLs; those
+  accounts keep working via name login until they register a new
+  account. There is no backfill (no mail is ever sent, so there is
+  nothing to verify against).

@@ -37,16 +37,25 @@ fn navView(a: std.mem.Allocator, env: components.ViewEnv) forest.Node {
     // Identity chip is bound (`#who` + .text) so identity changes
     // patch in live.
     links.append(a, forest.el(a, .span, .{ .id = "who", .class = "who", .text = env.name }, .{})) catch @panic("OOM");
+    // Auth controls sit behind a `variant` boundary: anonymous viewers
+    // get "login · register" links, logged-in viewers "@name" plus a
+    // logout button. A plain `if` would shift unkeyed siblings, so a
+    // clone-fork auth transition couldn't reliably swap the chrome —
+    // the `z-when:nav-auth` anchors make the branch replace
+    // idempotently (same reason delete buttons/posting-as hints use
+    // `when`, see components.zig).
+    var auth_kids: std.ArrayListUnmanaged(forest.Node) = .empty;
     if (env.account_id != null) {
-        links.append(a, forest.el(a, .button, .{
+        auth_kids.append(a, forest.el(a, .button, .{
             .class = "mini nav-logout",
             .on = .{ .click = "logout" },
         }, "log out")) catch @panic("OOM");
     } else {
-        links.append(a, forest.el(a, .a, .{ .href = components.loginHref(a), .class = "auth-link" }, "login")) catch @panic("OOM");
-        links.append(a, forest.text(" · ")) catch @panic("OOM");
-        links.append(a, forest.el(a, .a, .{ .href = components.registerHref(a), .class = "auth-link" }, "register")) catch @panic("OOM");
+        auth_kids.append(a, forest.el(a, .a, .{ .href = components.loginHref(a), .class = "auth-link" }, "login")) catch @panic("OOM");
+        auth_kids.append(a, forest.text(" · ")) catch @panic("OOM");
+        auth_kids.append(a, forest.el(a, .a, .{ .href = components.registerHref(a), .class = "auth-link" }, "register")) catch @panic("OOM");
     }
+    links.append(a, forest.variant(a, .{ .id = "nav-auth" }, if (env.account_id != null) "acct" else "anon", auth_kids.toOwnedSlice(a) catch @panic("OOM"))) catch @panic("OOM");
     return forest.el(a, .div, .{ .class = "bnav" }, links.toOwnedSlice(a) catch @panic("OOM"));
 }
 

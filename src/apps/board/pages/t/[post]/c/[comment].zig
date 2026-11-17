@@ -24,12 +24,14 @@ pub fn view(a: std.mem.Allocator, s: anytype, p: params, env: *const zmeta.Env) 
     _ = env;
     const venv = s.deps.viewEnv();
     const mm = model.get();
-    const c = mm.comment(p.comment) orelse {
-        return components.notFoundView(a, "Комментарий не найден.");
-    };
-    const post = mm.post(c.post) orelse {
-        return components.notFoundView(a, "Тред не найден.");
-    };
+    // Same `variant` boundary as the thread page: a comment (or its
+    // post) deleted while the permalink is open must swap the live DOM
+    // to not-found content — `z-when:w-comment` carries the branch
+    // swap idempotently where a plain early return couldn't.
+    const c = mm.comment(p.comment) orelse
+        return forest.variant(a, .{ .id = "w-comment" }, "no-comment", components.notFoundView(a, "Комментарий не найден."));
+    const post = mm.post(c.post) orelse
+        return forest.variant(a, .{ .id = "w-comment" }, "no-post", components.notFoundView(a, "Тред не найден."));
     // Ancestor chain root→…→c (excluding c itself — it renders as root).
     var chain_rev: std.ArrayListUnmanaged(u64) = .empty;
     var cur: ?u64 = c.parent;
@@ -50,5 +52,5 @@ pub fn view(a: std.mem.Allocator, s: anytype, p: params, env: *const zmeta.Env) 
     const only = a.alloc(forest.Node, 1) catch @panic("OOM");
     only[0] = components.commentNode(a, venv, c, components.u64str(a, post.id));
     kids.append(a, forest.el(a, .ul, .{ .id = "comments", .class = "comments" }, forest.each(only))) catch @panic("OOM");
-    return forest.fragment(a, kids.toOwnedSlice(a) catch @panic("OOM"));
+    return forest.variant(a, .{ .id = "w-comment" }, "ok", forest.fragment(a, kids.toOwnedSlice(a) catch @panic("OOM")));
 }

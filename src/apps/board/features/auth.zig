@@ -66,23 +66,25 @@ pub fn resolveAuth(s: *app.Session, token: ?[]const u8) void {
     s.deps.account_id = if (token) |t| model.get().accountByAuthToken(t) else null;
 }
 
-/// `register` — fields {name, password, confirm} → create the
+/// `register` — fields {name, email, password, confirm} → create the
 /// account AND log in (register == auto-login): PBKDF2 hash +
 /// fresh auth token land in one model call, `zfxa` rides
 /// `out_cookie2` on this response. `confirm` must match `password`
-/// — it's the only client-side check the server repeats.
+/// — it's the only client-side check the server repeats. Email
+/// validation/normalization lives in the model (lowercased store).
 pub fn onRegister(s: *app.Session, arg: ?[]const u8, value: ?[]const u8, fields: ?*const std.json.ObjectMap) !void {
     _ = arg;
     _ = value;
     const f = fields orelse return error.InvalidAction;
     const name = app.fieldStr(f, "name") orelse return error.InvalidAction;
+    const email = app.fieldStr(f, "email") orelse return error.InvalidAction;
     const password = app.fieldStr(f, "password") orelse return error.InvalidAction;
     const confirm = app.fieldStr(f, "confirm") orelse return error.InvalidAction;
     if (!std.mem.eql(u8, password, confirm)) return error.InvalidPassword;
     var salt: [model.password_salt_len]u8 = undefined;
     s.io.random(&salt);
     const token = mintAuthToken(s);
-    const id = model.get().registerAccount(name, password, &salt, token) catch |e| {
+    const id = model.get().registerAccount(name, email, password, &salt, token) catch |e| {
         s.gpa.free(token);
         return e;
     };
@@ -91,17 +93,19 @@ pub fn onRegister(s: *app.Session, arg: ?[]const u8, value: ?[]const u8, fields:
     s.deps.ping.emit(.{});
 }
 
-/// `login` — fields {name, password} → verify, mint a FRESH
+/// `login` — fields {email, password} → verify, mint a FRESH
 /// `zfxa` (one live token per account — a second login invalidates
 /// the first cookie), set session auth + `out_cookie2`.
-/// BadLogin covers unknown name AND wrong password alike.
+/// The field is the EMAIL for email-registered accounts; pre-email
+/// accounts still resolve by name (model.verifyAccount). BadLogin
+/// covers unknown identifier AND wrong password alike.
 pub fn onLogin(s: *app.Session, arg: ?[]const u8, value: ?[]const u8, fields: ?*const std.json.ObjectMap) !void {
     _ = arg;
     _ = value;
     const f = fields orelse return error.InvalidAction;
-    const name = app.fieldStr(f, "name") orelse return error.InvalidAction;
+    const identifier = app.fieldStr(f, "email") orelse return error.InvalidAction;
     const password = app.fieldStr(f, "password") orelse return error.InvalidAction;
-    const id = try model.get().verifyAccount(name, password);
+    const id = try model.get().verifyAccount(identifier, password);
     const token = mintAuthToken(s);
     model.get().attachAuthToken(id, token) catch |e| {
         s.gpa.free(token);
@@ -168,6 +172,7 @@ test "auth actions: register/login/logout set session auth + zfxa cookie" {
     // Set-Cookie rides out_cookie2 on THIS response only.
     var rf = app.fieldsOf(alloc, &.{
         .{ "name", "alice" },
+        .{ "email", "alice@x.z" },
         .{ "password", "password1" },
         .{ "confirm", "password1" },
     });
@@ -199,28 +204,30 @@ test "auth actions: register/login/logout set session auth + zfxa cookie" {
     // → BadLogin; unknown name → BadLogin.
     var bad = app.fieldsOf(alloc, &.{
         .{ "name", "bob" },
+        .{ "email", "bob@x.z" },
         .{ "password", "password1" },
         .{ "confirm", "password2" },
     });
     defer bad.deinit(alloc);
     try std.testing.expectError(error.InvalidPassword, s.dispatch("register", null, null, &bad));
     var lf = app.fieldsOf(alloc, &.{
-        .{ "name", "alice" },
+        .{ "email", "alice@x.z" },
         .{ "password", "wrong-pass" },
     });
     defer lf.deinit(alloc);
     try std.testing.expectError(error.BadLogin, s.dispatch("login", null, null, &lf));
     var lf2 = app.fieldsOf(alloc, &.{
-        .{ "name", "ghost" },
+        .{ "email", "ghost@x.z" },
         .{ "password", "password1" },
     });
     defer lf2.deinit(alloc);
     try std.testing.expectError(error.BadLogin, s.dispatch("login", null, null, &lf2));
 
     // login mints a FRESH token: the previous zfxa stops resolving
-    // everywhere (one live token per account).
+    // everywhere (one live token per account). The login field is the
+    // account EMAIL — case-insensitive.
     var ok = app.fieldsOf(alloc, &.{
-        .{ "name", "alice" },
+        .{ "email", "Alice@X.Z" },
         .{ "password", "password1" },
     });
     defer ok.deinit(alloc);
@@ -267,6 +274,7 @@ test "render groups: account auth splits the key; login forks, logout rejoins" {
     // the forked group continues the anon stream lineage.
     var rf = app.fieldsOf(alloc, &.{
         .{ "name", "alice" },
+        .{ "email", "alice@x.z" },
         .{ "password", "password1" },
         .{ "confirm", "password1" },
     });
@@ -329,6 +337,7 @@ test "delete actions: own-content delete end-to-end; foreign/anon rejected" {
     // a registers → posts carry acct=1.
     var rf = app.fieldsOf(alloc, &.{
         .{ "name", "alice" },
+        .{ "email", "alice@x.z" },
         .{ "password", "password1" },
         .{ "confirm", "password1" },
     });

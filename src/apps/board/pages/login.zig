@@ -1,5 +1,7 @@
-//! "/login" — account sign-in (ADR-0001 phase 2). Static route, no
-//! params, no prepare gate; the form posts the `login` action.
+//! "/login" — account sign-in (ADR-0001 phase 2 + email auth). Static
+//! route, no params, no prepare gate; the form posts the `login`
+//! action. The identifier field is the account EMAIL (pre-email
+//! accounts still resolve by name server-side).
 const std = @import("std");
 const forest = @import("forest");
 const zmeta = @import("../zmeta.zig");
@@ -13,7 +15,7 @@ pub fn view(a: std.mem.Allocator, s: anytype, p: params, env: *const zmeta.Env) 
     _ = env;
     const venv = s.deps.viewEnv();
     const fields = [_]forest.Node{
-        components.authField(a, "name", "text", "имя", "username"),
+        components.authField(a, "email", "email", "email", "username"),
         components.authField(a, "password", "password", "пароль", "current-password"),
     };
     return components.authPage(a, venv, "Вход", "login", &fields, "Войти", .{ .label = "нет аккаунта? регистрация", .href = components.registerHref(a) });

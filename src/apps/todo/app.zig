@@ -101,6 +101,12 @@ pub const TodoDeps = struct {
     /// `ztd` cookie value — the persistence key. Owned copy ("" =
     /// anonymous: no store installed, or first contact not yet POSTed).
     client_id: []u8 = &.{},
+    /// True while the browser may not hold `client_id` yet: set when
+    /// WE mint it, cleared only after a dispatch SUCCEEDS (the server
+    /// emits `out_cookie` on success responses only — a rejected first
+    /// action would otherwise lose the cookie forever while later
+    /// writes keep landing under the unshipped identity).
+    client_cookie_pending: bool = false,
     /// Scratch for the one-shot `ztd` Set-Cookie staged on the
     /// minting POST — `Session.out_cookie` points into it.
     out_cookie_buf: [128]u8 = undefined,
@@ -195,10 +201,15 @@ pub const TodoDeps = struct {
     ) !void {
         // `out_cookie` is a one-shot: the server emits it on this
         // response only — later POSTs must not re-send Set-Cookie.
+        // A minted `ztd` stays "pending" until a dispatch SUCCEEDS —
+        // rejected actions return before the server emits the header,
+        // so the next dispatch re-stages it (Set-Cookie is idempotent).
         s.out_cookie = "";
         ensureIdentity(s);
         ensureLoaded(s);
-        return actions.dispatch(s, action, arg, value, fields);
+        actions.dispatch(s, action, arg, value, fields) catch |err| return err;
+        s.deps.client_cookie_pending = false;
+        return;
     }
 
     /// act.add — new todo; `fields.title` required, trimmed, length- and
@@ -397,16 +408,25 @@ fn updateRemaining(s: *Session, _: u64) void {
 
 /// First POST establishes client identity: mint a `ztd` token (16
 /// io-random bytes as 32 lowercase hex chars — unguessable,
-/// cookie-safe) and stage the one-shot Set-Cookie. No store installed
-/// → persistence disabled → behave exactly like the old demo.
+/// cookie-safe) and stage the Set-Cookie. A self-minted token stays
+/// `client_cookie_pending` and its header re-staged on EVERY dispatch
+/// until one succeeds — the server only emits `out_cookie` on the
+/// success path, so a rejected first action must not strand the
+/// identity (later todos would persist under a key the browser never
+/// received). No store installed → persistence disabled → behave
+/// exactly like the old demo.
 fn ensureIdentity(s: *Session) void {
     if (store.shared == null) return;
-    if (s.deps.client_id.len != 0) return;
-    var rb: [16]u8 = undefined;
-    s.io.random(&rb);
-    const hex = std.fmt.bytesToHex(rb, .lower);
-    s.deps.client_id = s.gpa.dupe(u8, &hex) catch @panic("OOM");
-    s.out_cookie = std.fmt.bufPrint(&s.deps.out_cookie_buf, "{s}={s}; Path=/; HttpOnly; SameSite=Strict", .{ TodoDeps.client_cookie_name, s.deps.client_id }) catch @panic("cookie buf too small");
+    if (s.deps.client_id.len == 0) {
+        var rb: [16]u8 = undefined;
+        s.io.random(&rb);
+        const hex = std.fmt.bytesToHex(rb, .lower);
+        s.deps.client_id = s.gpa.dupe(u8, &hex) catch @panic("OOM");
+        s.deps.client_cookie_pending = true;
+    }
+    if (s.deps.client_cookie_pending) {
+        s.out_cookie = std.fmt.bufPrint(&s.deps.out_cookie_buf, "{s}={s}; Path=/; HttpOnly; SameSite=Strict", .{ TodoDeps.client_cookie_name, s.deps.client_id }) catch @panic("cookie buf too small");
+    }
 }
 
 /// Lazy load: the first time a session knows its `client_id` (cookie
@@ -508,6 +528,9 @@ fn applyMutation(s: *Session, m: Mutation) void {
                 s.gpa.free(s.deps.todos.items[i].title);
                 _ = s.deps.todos.orderedRemove(i);
                 persistDelete(s, es.id);
+                // Deletion still bumps the revision — removal patches
+                // and the derived remaining-count must reach clients.
+                s.bumpSeq();
                 return;
             }
             const owned = s.gpa.dupe(u8, text) catch @panic("OOM");
@@ -909,6 +932,42 @@ test "persistence: first POST mints ztd, new session reloads rows" {
     try std.testing.expectEqual(a.deps.next_id, b.deps.next_id);
     // The recount ran at load: footer count reflects persisted state.
     try std.testing.expectEqual(@as(usize, 1), b.deps.remaining.get());
+}
+
+test "persistence: rejected first action keeps ztd pending until a success" {
+    const alloc = std.testing.allocator;
+    const st = installStore(alloc, ":memory:");
+    defer st.deinit();
+    defer store.shared = null;
+
+    const s = createSession(alloc);
+    defer s.deinit();
+    s.seedDom();
+
+    // Rejected first action: `ensureIdentity` still mints client_id and
+    // stages Set-Cookie, but the server drops the header on the error
+    // path — `client_cookie_pending` must survive so the NEXT dispatch
+    // re-stages it (otherwise later todos persist under an identity
+    // the browser never received).
+    try std.testing.expectError(error.InvalidAction, s.dispatch("hack", null, null, null));
+    try std.testing.expect(s.deps.client_id.len != 0);
+    try std.testing.expect(s.deps.client_cookie_pending);
+    try std.testing.expect(std.mem.startsWith(u8, s.out_cookie, "ztd="));
+
+    var f1 = titleFields(alloc, "after reject");
+    defer f1.deinit(alloc);
+    try s.dispatch("add", null, null, &f1);
+    // Re-staged on the successful dispatch — same token, then cleared.
+    try std.testing.expect(std.mem.startsWith(u8, s.out_cookie, "ztd="));
+    try std.testing.expect(std.mem.indexOf(u8, s.out_cookie, s.deps.client_id) != null);
+    try std.testing.expect(!s.deps.client_cookie_pending);
+    alloc.free(patchJson(s, alloc));
+
+    // And it stays one-shot afterwards.
+    var f2 = titleFields(alloc, "second");
+    defer f2.deinit(alloc);
+    try s.dispatch("add", null, null, &f2);
+    try std.testing.expectEqual(@as(usize, 0), s.out_cookie.len);
 }
 
 test "persistence: delete, edit_save and set_checked write through" {

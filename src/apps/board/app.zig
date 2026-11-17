@@ -104,6 +104,12 @@ pub const BoardDeps = struct {
     sort: components.Sort = .new,
     /// zfxu cookie value — the anonymous poster identity ("" = anonymous).
     user_token: []u8 = &.{},
+    /// True while the browser may not hold `user_token` yet: set when
+    /// WE mint it, cleared only after a dispatch SUCCEEDS (the server
+    /// emits `out_cookie` on success responses only — a rejected first
+    /// action would otherwise lose the cookie forever while later
+    /// writes keep landing under the unshipped identity).
+    user_cookie_pending: bool = false,
     /// zfxa-resolved account id (null = anonymous). The account NAME is
     /// never stored — `model.accountName(id)` resolves it at render.
     /// Re-resolved from the cookie on every `readCookies`, so a token
@@ -329,9 +335,14 @@ pub const BoardDeps = struct {
         // Set-Cookie headers.
         s.out_cookie = "";
         s.out_cookie2 = "";
-        // Every POST establishes identity on first contact.
+        // Every POST establishes identity on first contact. A minted
+        // zfxu stays "pending" until a dispatch SUCCEEDS — rejected
+        // actions return before the server emits out_cookie, so the
+        // next dispatch re-stages it (Set-Cookie is idempotent).
         try ensureUser(s);
-        return actions.dispatch(s, action, arg, value, fields);
+        actions.dispatch(s, action, arg, value, fields) catch |err| return err;
+        s.deps.user_cookie_pending = false;
+        return;
     }
 
     /// `post` — fields {board, text, trip?} → addPost on the shared
@@ -739,6 +750,11 @@ pub const Session = struct {
 
 /// Every POST needs a resolvable identity: mint on first contact, or
 /// heal a cookie token that has no users row (db reset / forged).
+/// A self-minted token is flagged `user_cookie_pending` and its
+/// Set-Cookie re-staged on EVERY dispatch until one succeeds — the
+/// server only emits `out_cookie` on the success path, so a rejected
+/// first action must not strand the identity (the browser would keep
+/// posting under a token it never received).
 fn ensureUser(s: *Session) !void {
     if (s.deps.user_token.len == 0) {
         var rb: [16]u8 = undefined;
@@ -746,9 +762,11 @@ fn ensureUser(s: *Session) !void {
         const tok = std.fmt.allocPrint(s.gpa, "{x}", .{std.mem.readInt(u64, rb[0..8], .little)}) catch @panic("OOM");
         errdefer s.gpa.free(tok);
         _ = try model.get().ensureUser(tok);
-        s.out_cookie = std.fmt.bufPrint(&s.deps.out_cookie_buf, "{s}={s}; Path=/; SameSite=Lax", .{ user_cookie_name, tok }) catch @panic("cookie buf too small");
         s.deps.user_token = tok;
-        return;
+        s.deps.user_cookie_pending = true;
+    }
+    if (s.deps.user_cookie_pending) {
+        s.out_cookie = std.fmt.bufPrint(&s.deps.out_cookie_buf, "{s}={s}; Path=/; SameSite=Lax", .{ user_cookie_name, s.deps.user_token }) catch @panic("cookie buf too small");
     }
     if (model.get().userName(s.deps.user_token) == null) {
         _ = try model.get().ensureUser(s.deps.user_token);
@@ -1216,6 +1234,22 @@ test "identity minted by a failed POST fans out via global_seq" {
     try std.testing.expectEqual(seq1, mm.global_seq.load(.seq_cst));
     s.syncPull();
     try std.testing.expectEqual(@as(usize, 0), s.log.patches.items.len);
+
+    // …but the minted zfxu stays "pending": the server drops
+    // out_cookie on the error path, so every retry re-stages it until
+    // a dispatch succeeds (otherwise later posts land under an
+    // identity the browser never received).
+    try std.testing.expect(s.deps.user_cookie_pending);
+    try std.testing.expect(std.mem.startsWith(u8, s.out_cookie, "zfxu="));
+
+    var pf: std.json.ObjectMap = .empty;
+    defer pf.deinit(alloc);
+    try pf.put(alloc, "board", .{ .string = "b" });
+    try pf.put(alloc, "text", .{ .string = "first ok" });
+    try s.dispatch("post", null, null, &pf);
+    try std.testing.expect(!s.deps.user_cookie_pending);
+    try std.testing.expect(std.mem.startsWith(u8, s.out_cookie, "zfxu="));
+    alloc.free(patchJson(s, alloc));
 }
 
 test "heal path: cookie token with no users row bumps global_seq on POST" {
