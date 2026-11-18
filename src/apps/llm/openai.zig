@@ -239,10 +239,13 @@ pub fn worker(mb: *state.Mailbox) void {
         hdrs = hdr_storage[0..1];
     }
 
-    pushRaw(mb, if (is_models)
+    // Inspector "req" entry: method + url + exact body bytes. The API
+    // key travels in the Authorization header — never logged.
+    const req_desc = if (is_models)
         std.fmt.allocPrint(gpa, "GET {s}", .{job.url}) catch ""
     else
-        job.body);
+        std.fmt.allocPrint(gpa, "POST {s}\n\n{s}", .{ job.url, job.body }) catch job.body;
+    mb.push(.{ .req = state.dupe(mb.gpa, req_desc) });
 
     var req = client.request(method, uri, .{
         .keep_alive = true,

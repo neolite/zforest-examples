@@ -3,6 +3,14 @@
 //! raw inspector strip at the bottom. Everything re-renders through
 //! the normal forest diff on each mailbox drain (`Deps.syncPull` →
 //! ping → bumpSeq → render).
+//!
+//! Live-update contract (forest diff semantics): `.child(str)` nodes
+//! are STATIC — diffNode never revisits them. Anything that changes
+//! after mount must be a bound leaf: `.id`/`.lid` + `.text(v)` for
+//! text content, or an attr (`.class`/`.value`/`.attr`) on a bound
+//! element. Structural add/remove goes through `eachOf` keyed lists
+//! or `when`/`variant` branches — plain `.nodes` children can't
+//! create elements client-side.
 const std = @import("std");
 const forest = @import("forest");
 const zmeta = @import("../zmeta.zig");
@@ -129,6 +137,7 @@ fn sideBar(a: std.mem.Allocator, s: *Session) forest.Node {
                 .node()),
             h.p(a).class("hint").child("preset fills base URL, model & context window — you still need an API key").node(),
             field(a, "Base URL", h.input(a)
+                .id("cfg-base")
                 .class("mono")
                 .placeholder("https://api.openai.com/v1")
                 .value(s.deps.cfg.base_url)
@@ -146,29 +155,33 @@ fn sideBar(a: std.mem.Allocator, s: *Session) forest.Node {
             }).node()),
             field(a, "Model", modelControl(a, s)),
             field(a, "System prompt", h.textarea(a)
+                .id("cfg-system")
                 .attr("rows", "3")
                 .value(s.deps.cfg.system)
                 .child(s.deps.cfg.system)
                 .on(.change, act.cfg_system).node()),
             h.div(a).class("grid2").children(.{
                 field(a, "Temperature", h.input(a)
+                    .id("cfg-temp")
                     .type("number").attr("step", "0.1").attr("min", "0").attr("max", "2")
                     .value(f64Str(a, s.deps.cfg.temperature))
                     .on(.change, act.cfg_temperature).node()),
                 field(a, "Top-p", h.input(a)
+                    .id("cfg-topp")
                     .type("number").attr("step", "0.05").attr("min", "0").attr("max", "1")
                     .value(f64Str(a, s.deps.cfg.top_p))
                     .on(.change, act.cfg_top_p).node()),
                 field(a, "Context window", h.input(a)
+                    .id("cfg-ctxwin")
                     .type("number").attr("step", "1024")
                     .value(u32Str(a, s.deps.cfg.context_window))
                     .on(.change, act.cfg_context_window).node()),
                 field(a, "Tools", h.select(a)
                     .on(.change, act.cfg_tool_mode)
                     .child(.{
-                        h.option(a).value("off").attr("selected", s.deps.cfg.tool_mode == .off).child("off").node(),
-                        h.option(a).value("manual").attr("selected", s.deps.cfg.tool_mode == .manual).child("manual (approve)").node(),
-                        h.option(a).value("auto").attr("selected", s.deps.cfg.tool_mode == .auto).child("auto").node(),
+                        h.option(a).id("tm-off").value("off").attr("selected", s.deps.cfg.tool_mode == .off).child("off").node(),
+                        h.option(a).id("tm-manual").value("manual").attr("selected", s.deps.cfg.tool_mode == .manual).child("manual (approve)").node(),
+                        h.option(a).id("tm-auto").value("auto").attr("selected", s.deps.cfg.tool_mode == .auto).child("auto").node(),
                     }).node()),
             }).node(),
         }).node(),
@@ -176,6 +189,7 @@ fn sideBar(a: std.mem.Allocator, s: *Session) forest.Node {
             h.h2(a).child("Tools (JSON)").node(),
             h.p(a).class("hint").child("OpenAI tools array. \"exec\":\"builtin\" runs a builtin (calculator, datetime_now, echo, word_count, uuid, random_number, http_status…); otherwise mock. \"builtin\":\"name\" aliases the wire name.").node(),
             h.textarea(a)
+                .id("cfg-tools")
                 .class("mono tools-json")
                 .attr("rows", "10")
                 .value(s.deps.cfg.tools_json)
@@ -198,6 +212,7 @@ fn presetOptions(a: std.mem.Allocator, s: *Session) forest.Node {
     var opts: std.ArrayListUnmanaged(forest.Node) = .empty;
     for (presets.presets) |p| {
         opts.append(a, h.option(a)
+            .id(h.f(a, "preset-{s}", .{p.id}))
             .value(p.id)
             .attr("selected", std.mem.eql(u8, p.id, cur))
             .child(p.label)
@@ -207,33 +222,43 @@ fn presetOptions(a: std.mem.Allocator, s: *Session) forest.Node {
 }
 
 /// Endpoint health line — last wire operation outcome so the user
-/// sees at a glance whether the provider was reached.
+/// sees at a glance whether the provider was reached. One bound
+/// element: class + text both diff live.
 fn endpointStatus(a: std.mem.Allocator, s: *Session) forest.Node {
     const e = s.deps.endpoint;
-    return switch (e.kind) {
-        .idle => h.div(a).class("ep-status ep-idle")
-            .child("no endpoint test yet — pick a preset, add a key, then “models” or send")
-            .node(),
-        .busy => h.div(a).class("ep-status ep-busy")
-            .child(h.f(a, "… {s}", .{e.text})).node(),
-        .ok => h.div(a).class("ep-status ep-ok")
-            .child(h.f(a, "✓ {s}", .{e.text})).node(),
-        .err => h.div(a).class("ep-status ep-err")
-            .child(h.f(a, "✗ {s}", .{e.text})).node(),
+    const kind: []const u8 = switch (e.kind) {
+        .idle => "idle",
+        .busy => "busy",
+        .ok => "ok",
+        .err => "err",
     };
+    const text: []const u8 = switch (e.kind) {
+        .idle => "no endpoint test yet — pick a preset, add a key, then “models” or send",
+        .busy => h.f(a, "… {s}", .{e.text}),
+        .ok => h.f(a, "✓ {s}", .{e.text}),
+        .err => h.f(a, "✗ {s}", .{e.text}),
+    };
+    return h.div(a)
+        .id("ep-status")
+        .class(h.f(a, "ep-status ep-{s}", .{kind}))
+        .text(text)
+        .node();
 }
 
-/// Model picker: a <select> over the fetched /models ids once they
-/// exist, a plain text input before that (custom endpoints without
-/// /models still work).
+/// Model picker: `variant` swaps between a text input (no /models
+/// yet) and a <select> over fetched ids. The select branch key carries
+/// the model list shape + current model, so any change re-ships the
+/// whole branch markup with correct `selected` attrs — option-level
+/// diffs can't reach inside a swapped branch anyway.
 fn modelControl(a: std.mem.Allocator, s: *Session) forest.Node {
     const cur = s.deps.cfg.model;
     if (s.deps.models.len == 0) {
-        return h.input(a)
+        return forest.variant(a, .{ .id = "model-ctl" }, "input", h.input(a)
+            .id("cfg-model-in")
             .class("mono")
             .placeholder("model id")
             .value(cur)
-            .on(.change, act.cfg_model).node();
+            .on(.change, act.cfg_model).node());
     }
     const g = a;
     var opts: std.ArrayListUnmanaged(forest.Node) = .empty;
@@ -258,7 +283,11 @@ fn modelControl(a: std.mem.Allocator, s: *Session) forest.Node {
             .child(id)
             .node()) catch @panic("OOM");
     }
-    return h.select(a).on(.change, act.cfg_model).child(h.fragment(a, opts.items)).node();
+    const n = s.deps.models.len;
+    const first = s.deps.models[0];
+    const last = s.deps.models[n - 1];
+    const key = h.f(a, "sel:{d}:{s}:{s}:{s}", .{ n, first, last, cur });
+    return forest.variant(a, .{ .id = "model-ctl" }, key, h.select(a).on(.change, act.cfg_model).child(h.fragment(a, opts.items)).node());
 }
 
 fn field(a: std.mem.Allocator, label: []const u8, control: forest.Node) forest.Node {
@@ -282,10 +311,11 @@ fn chatRow(a: std.mem.Allocator, s: *Session, c: *state.Conversation) ?forest.No
         .class(if (active) "chat active" else "chat")
         .children(.{
             h.button(a)
+                .lid("pick")
                 .class("chat-pick")
                 .on(.click, act.select_chat)
                 .arg(arg)
-                .child(c.title)
+                .text(c.title)
                 .node(),
             h.button(a)
                 .class("chat-del")
@@ -314,10 +344,18 @@ fn ctxBar(a: std.mem.Allocator, s: *Session) forest.Node {
     return h.div(a).class("ctxbar").children(.{
         h.div(a).class("ctxbar-top").children(.{
             h.span(a).class("ctxbar-label").child("context").node(),
-            h.span(a).class("ctxbar-num").child(h.f(a, "~{d} est / {d} window ({d}%)", .{ est, win, pct })).node(),
+            h.span(a)
+                .id("ctxbar-num")
+                .class("ctxbar-num")
+                .text(h.f(a, "~{d} est / {d} window ({d}%)", .{ est, win, pct }))
+                .node(),
         }).node(),
         h.div(a).class("ctxbar-track").children(.{
-            h.div(a).class("ctxbar-fill").attr("style", h.f(a, "width:{d}%", .{pct})).node(),
+            h.div(a)
+                .id("ctxbar-fill")
+                .class("ctxbar-fill")
+                .attr("style", h.f(a, "width:{d}%", .{pct}))
+                .node(),
         }).node(),
     }).node();
 }
@@ -334,49 +372,82 @@ fn msgRowOrNull(a: std.mem.Allocator, s: *Session, m: *state.Msg) ?forest.Node {
     return msgRow(a, m);
 }
 
+/// Per-call index counter for the keyed `calls` list — eachOf hands
+/// the render fn no index, so ctx carries a mutable cursor.
+const CallIdx = struct {
+    ord: usize,
+    i: usize = 0,
+};
+
 fn msgRow(a: std.mem.Allocator, m: *state.Msg) forest.Node {
     const role = roleLabel(m);
-    var kids: std.ArrayListUnmanaged(forest.Node) = .empty;
     const g = a;
 
+    var kids: std.ArrayListUnmanaged(forest.Node) = .empty;
+
+    // Head: role label is fixed per message (static); the status chip
+    // changes streaming → ok/failed → bound class + text, always mounted.
     kids.append(g, h.div(a).class("msg-head").children(.{
         h.span(a).class(h.f(a, "role role-{s}", .{@tagName(m.role)})).child(role).node(),
-        if (m.status != .ok)
-            h.span(a).class(h.f(a, "msg-status st-{s}", .{@tagName(m.status)})).child(statusLabel(m)).node()
-        else
-            h.span(a).node(),
+        h.span(a)
+            .lid("status")
+            .class(h.f(a, "msg-status st-{s}", .{@tagName(m.status)}))
+            .text(if (m.status == .ok) "" else statusLabel(m))
+            .node(),
     }).node()) catch @panic("OOM");
 
-    if (m.reasoning.items.len != 0) {
-        kids.append(g, h.details(a).class("reasoning").children(.{
-            h.summary(a).child("reasoning").node(),
-            h.pre(a).class("mono").child(m.reasoning.items).node(),
-        }).node()) catch @panic("OOM");
-    }
+    // Reasoning streams into <details> — `when` mounts the branch on
+    // first delta and the bound <pre> keeps diffing its text after.
+    // Emitted unconditionally so the anchor markers stay stable.
+    kids.append(g, forest.when(a, .{ .lid = "reasoning" }, m.reasoning.items.len != 0, h.details(a).class("reasoning").children(.{
+        h.summary(a).child("reasoning").node(),
+        h.pre(a)
+            .class("mono")
+            .lid("rtext")
+            .text(@as([]const u8, m.reasoning.items))
+            .node(),
+    }).node())) catch @panic("OOM");
 
-    if (m.text.items.len != 0 or m.status == .streaming) {
-        kids.append(g, h.div(a).class("msg-text").child(m.text.items).node()) catch @panic("OOM");
-    }
-    if (m.status == .streaming) {
-        kids.append(g, h.span(a).class("cursor").child("▍").node()) catch @panic("OOM");
-    }
-    if (m.status == .failed) {
-        kids.append(g, h.div(a).class("msg-err").child(m.err orelse "unknown error").node()) catch @panic("OOM");
-    }
+    // Body text: always mounted, bound — grows token by token.
+    kids.append(g, h.div(a)
+        .lid("text")
+        .class(if (m.text.items.len == 0 and m.status != .streaming) "msg-text hidden" else "msg-text")
+        .text(@as([]const u8, m.text.items))
+        .node()) catch @panic("OOM");
 
-    for (m.calls.items, 0..) |*c, ci| {
-        kids.append(g, callCard(a, m, c, ci)) catch @panic("OOM");
-    }
+    // Streaming caret — bound text, empty when idle.
+    kids.append(g, h.span(a)
+        .lid("cursor")
+        .class("cursor")
+        .text(if (m.status == .streaming) "▍" else "")
+        .node()) catch @panic("OOM");
 
-    if (m.role == .assistant) {
-        if (m.usage) |u| {
-            if (u.total != 0) {
-                kids.append(g, h.div(a).class("msg-usage").child(
-                    h.f(a, "tokens: {d} prompt + {d} completion = {d}", .{ u.prompt, u.completion, u.total }),
-                ).node()) catch @panic("OOM");
-            }
-        }
-    }
+    // Error line — hidden unless failed.
+    kids.append(g, h.div(a)
+        .lid("err")
+        .class(if (m.status == .failed) "msg-err" else "msg-err hidden")
+        .text(m.err orelse "")
+        .node()) catch @panic("OOM");
+
+    // Tool calls: keyed list inside a bound wrapper — call rows are
+    // created/removed by the keyed diff, their leaves diff in place.
+    var cidx = CallIdx{ .ord = m.ord };
+    kids.append(g, h.div(a)
+        .lid("calls")
+        .class("calls")
+        .child(h.eachOf(a, m.calls.items, &cidx, callRow))
+        .node()) catch @panic("OOM");
+
+    // Token usage line — hidden until the provider reports usage.
+    const usage_str: []const u8 = if (m.usage) |u| blk: {
+        if (u.total == 0) break :blk "";
+        break :blk h.f(a, "tokens: {d} prompt + {d} completion = {d}", .{ u.prompt, u.completion, u.total });
+    } else "";
+    kids.append(g, h.div(a)
+        .lid("usage")
+        .class(if (usage_str.len == 0) "msg-usage hidden" else "msg-usage")
+        .text(usage_str)
+        .node()) catch @panic("OOM");
 
     return h.div(a)
         .class(h.f(a, "msg msg-{s}", .{@tagName(m.role)}))
@@ -385,30 +456,48 @@ fn msgRow(a: std.mem.Allocator, m: *state.Msg) forest.Node {
         .node();
 }
 
-fn callCard(a: std.mem.Allocator, m: *state.Msg, c: *state.ToolCall, ci: usize) forest.Node {
-    var kids: std.ArrayListUnmanaged(forest.Node) = .empty;
-    const g = a;
-
-    kids.append(g, h.div(a).class("call-head").children(.{
-        h.span(a).class("call-name mono").child(c.name).node(),
-        h.span(a).class(h.f(a, "call-state cs-{s}", .{@tagName(c.state)})).child(callStateLabel(c)).node(),
-    }).node()) catch @panic("OOM");
-
-    if (c.args_json.items.len != 0) {
-        kids.append(g, h.pre(a).class("mono call-args").child(c.args_json.items).node()) catch @panic("OOM");
-    }
-
-    if (c.state == .pending) {
-        const pos = h.f(a, "{d}:{d}", .{ m.ord, ci });
-        kids.append(g, h.div(a).class("call-actions").children(.{
-            h.button(a).class("btn approve").on(.click, act.approve_tool).arg(pos).child("approve").node(),
-            h.button(a).class("btn reject").on(.click, act.reject_tool).arg(pos).child("reject").node(),
-        }).node()) catch @panic("OOM");
-    }
-    if (c.result) |r| {
-        kids.append(g, h.pre(a).class("mono call-result").child(r).node()) catch @panic("OOM");
-    }
-    return h.div(a).class("tool-call").children(kids.items).node();
+fn callRow(a: std.mem.Allocator, ctx: *CallIdx, c: state.ToolCall) ?forest.Node {
+    const i = ctx.i;
+    ctx.i += 1;
+    const pos = h.f(a, "{d}:{d}", .{ ctx.ord, i });
+    const pending = c.state == .pending;
+    const has_args = c.args_json.items.len != 0;
+    const has_result = c.result != null and c.result.?.len != 0;
+    return h.div(a)
+        .class("tool-call")
+        .id(h.f(a, "call-{d}-{d}", .{ ctx.ord, i }))
+        .children(.{
+            h.div(a).class("call-head").children(.{
+                h.span(a)
+                    .lid("name")
+                    .class("call-name mono")
+                    .text(@as([]const u8, c.name))
+                    .node(),
+                h.span(a)
+                    .lid("state")
+                    .class(h.f(a, "call-state cs-{s}", .{@tagName(c.state)}))
+                    .text(callStateLabel(&c))
+                    .node(),
+            }).node(),
+            h.pre(a)
+                .lid("args")
+                .class(if (has_args) "mono call-args" else "mono call-args hidden")
+                .text(@as([]const u8, c.args_json.items))
+                .node(),
+            h.div(a)
+                .lid("actions")
+                .class(if (pending) "call-actions" else "call-actions hidden")
+                .children(.{
+                    h.button(a).class("btn approve").on(.click, act.approve_tool).arg(pos).child("approve").node(),
+                    h.button(a).class("btn reject").on(.click, act.reject_tool).arg(pos).child("reject").node(),
+                }).node(),
+            h.pre(a)
+                .lid("result")
+                .class(if (has_result) "mono call-result" else "mono call-result hidden")
+                .text(c.result orelse "")
+                .node(),
+        })
+        .node();
 }
 
 fn composer(a: std.mem.Allocator, s: *Session) forest.Node {
@@ -418,14 +507,22 @@ fn composer(a: std.mem.Allocator, s: *Session) forest.Node {
         .on(.submit, act.send)
         .children(.{
             h.textarea(a)
+                .id("composer-msg")
                 .name("message")
                 .attr("rows", "2")
                 .attr("autofocus", "")
-                .placeholder(if (busy) "streaming… message queues until the turn ends" else "Message the model…")
+                .attr("placeholder", if (busy) "streaming… message queues until the turn ends" else "Message the model…")
                 .node(),
             h.div(a).class("composer-btns").children(.{
                 h.button(a).class("btn primary").type("submit").child("send").node(),
-                h.button(a).class("btn danger").type("button").disabled(!busy).on(.click, act.stop).child("stop").node(),
+                h.button(a)
+                    .id("composer-stop")
+                    .class("btn danger")
+                    .type("button")
+                    .disabled(!busy)
+                    .on(.click, act.stop)
+                    .child("stop")
+                    .node(),
             }).node(),
         })
         .node();
@@ -437,7 +534,9 @@ fn inspCol(a: std.mem.Allocator, s: *Session) forest.Node {
     return h.div(a).class("llm-insp").children(.{
         h.h2(a).child("Inspector").node(),
         usageBox(a, s),
-        h.div(a).class("insp-log").id("insp-log").children(inspRows(a, s)).node(),
+        h.div(a).class("insp-log").id("insp-log").children(.{
+            inspRows(a, s),
+        }).node(),
     }).node();
 }
 
@@ -456,28 +555,55 @@ fn usageBox(a: std.mem.Allocator, s: *Session) forest.Node {
     return h.div(a).class("usage").children(.{
         h.div(a).class("usage-row").children(.{
             h.span(a).child("last reply").node(),
-            h.span(a).class("mono").child(h.f(a, "{d} + {d} tok", .{ prompt, completion })).node(),
+            h.span(a)
+                .id("usage-tok")
+                .class("mono")
+                .text(h.f(a, "{d} + {d} tok", .{ prompt, completion }))
+                .node(),
         }).node(),
         h.div(a).class("usage-row").children(.{
             h.span(a).child("est. context").node(),
-            h.span(a).class("mono").child(h.f(a, "~{d} tok", .{estCtx(s)})).node(),
+            h.span(a)
+                .id("usage-ctx")
+                .class("mono")
+                .text(h.f(a, "~{d} tok", .{estCtx(s)}))
+                .node(),
         }).node(),
         h.div(a).class("usage-row").children(.{
             h.span(a).child("tools").node(),
-            h.span(a).class("mono").child(h.f(a, "{d} def(s) · {s}", .{ s.deps.tool_defs.len, @tagName(s.deps.cfg.tool_mode) })).node(),
+            h.span(a)
+                .id("usage-tools")
+                .class("mono")
+                .text(h.f(a, "{d} def(s) · {s}", .{ s.deps.tool_defs.len, @tagName(s.deps.cfg.tool_mode) }))
+                .node(),
         }).node(),
     }).node();
 }
 
-fn inspRows(a: std.mem.Allocator, s: *Session) forest.Node {
+/// Keyed inspector rows — `seq` on each entry gives a stable id, so
+/// appends create one row and ring-cap eviction removes the oldest.
+fn inspRows(a: std.mem.Allocator, s: *Session) forest.Children {
     const items = s.deps.inspector.items;
     const start = if (items.len > 80) items.len - 80 else 0;
-    var rows: std.ArrayListUnmanaged(forest.Node) = .empty;
-    for (items[start..]) |e| {
-        rows.append(a, h.div(a).class("insp-row").children(.{
-            h.span(a).class(h.f(a, "insp-kind k-{s}", .{e.kind})).child(e.kind).node(),
-            h.pre(a).class("mono insp-text").child(e.text).node(),
-        }).node()) catch @panic("OOM");
-    }
-    return h.fragment(a, rows.items);
+    return h.eachOf(a, items[start..], s, inspRow);
+}
+
+fn inspRow(a: std.mem.Allocator, s: *Session, e: app.InspectorEntry) ?forest.Node {
+    _ = s;
+    return h.div(a)
+        .class("insp-row")
+        .id(h.f(a, "insp-{d}", .{e.seq}))
+        .children(.{
+            h.span(a)
+                .lid("kind")
+                .class(h.f(a, "insp-kind k-{s}", .{e.kind}))
+                .text(e.kind)
+                .node(),
+            h.pre(a)
+                .lid("text")
+                .class("mono insp-text")
+                .text(e.text)
+                .node(),
+        })
+        .node();
 }

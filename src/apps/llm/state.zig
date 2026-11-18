@@ -114,8 +114,10 @@ pub const Ev = union(enum) {
     done: ?[]const u8,
     /// Terminal failure description.
     err: []const u8,
-    /// Inspector-only raw payload (request body, SSE data line, note).
+    /// Inspector-only raw payload (response SSE data line, note).
     raw: []const u8,
+    /// Inspector-only outbound request descriptor (method+url+body).
+    req: []const u8,
     /// Fetched /models id list — the session ADOPTS the slice.
     models: [][]const u8,
 };
@@ -213,7 +215,7 @@ pub const Mailbox = struct {
 /// mailbox.deinit for leftovers.
 pub fn freeEv(gpa: std.mem.Allocator, ev: Ev) void {
     switch (ev) {
-        .delta, .reasoning, .err, .raw, .done => |s| {
+        .delta, .reasoning, .err, .raw, .req, .done => |s| {
             if (s) |x| gpa.free(x);
         },
         .call_delta => |cd| {

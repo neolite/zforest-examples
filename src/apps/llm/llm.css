@@ -26,6 +26,12 @@ html, body { margin: 0; padding: 0; background: var(--bg); color: var(--text);
 .app-llm { max-width: none; margin: 0; width: 100%; }
 
 .llm { display: grid; grid-template-columns: 300px 1fr 380px; height: 100vh; }
+/* Grid/flex items default to min-height:auto — without 0 the tallest
+   child's content stretches the row past 100vh and the whole PAGE
+   scrolls instead of each panel scrolling internally. */
+.llm-side, .llm-center, .llm-insp { min-height: 0; }
+.llm-center { display: flex; flex-direction: column; overflow: hidden; }
+.transcript, .insp-log { min-height: 0; }
 
 /* ── shared bits ─────────────────────────────────────────────── */
 .card { background: var(--bg2); border: 1px solid var(--border); border-radius: 10px;
@@ -170,3 +176,6 @@ textarea { resize: vertical; font-family: var(--mono); font-size: 12px; }
     .llm-side, .llm-insp { max-height: 40vh; border: none; border-bottom: 1px solid var(--border); }
     .transcript { min-height: 50vh; }
 }
+
+/* bound-leaf visibility toggles — elements stay mounted, class diffs flip display */
+.hidden { display: none !important; }

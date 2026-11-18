@@ -46,6 +46,9 @@ const max_tool_turns = 8;
 const send_queue_cap = 16;
 
 pub const InspectorEntry = struct {
+    /// Stable identity for the keyed inspector list (never reused,
+    /// survives ring-cap eviction of older entries).
+    seq: u64,
     kind: []const u8, // "req" | "sse" | "tool" | "sys" | "err"
     text: []const u8,
 };
@@ -73,6 +76,8 @@ pub const LlmDeps = struct {
     /// /models fetch result (sorted ids).
     models: [][]const u8 = &.{},
     inspector: std.ArrayListUnmanaged(InspectorEntry) = .empty,
+    /// Monotonic id source for InspectorEntry.seq.
+    insp_seq: u64 = 0,
     /// Active worker stream (chat or models fetch).
     mailbox: ?*state.Mailbox = null,
     /// User messages sent mid-stream, FIFO.
@@ -95,6 +100,7 @@ pub const LlmDeps = struct {
             .tool_defs = &.{},
             .models = &.{},
             .inspector = .empty,
+            .insp_seq = 0,
             .mailbox = null,
             .send_queue = .empty,
             .tool_turns = 0,
@@ -442,7 +448,8 @@ fn note(s: *Session, comptime kind: []const u8, text: []const u8) void {
         const old = s.deps.inspector.orderedRemove(0);
         g.free(old.text);
     }
-    s.deps.inspector.append(g, .{ .kind = kind, .text = state.dupe(g, text) }) catch @panic("OOM");
+    s.deps.insp_seq += 1;
+    s.deps.inspector.append(g, .{ .seq = s.deps.insp_seq, .kind = kind, .text = state.dupe(g, text) }) catch @panic("OOM");
 }
 
 fn noteOwned(s: *Session, comptime kind: []const u8, text: []const u8) void {
@@ -451,7 +458,8 @@ fn noteOwned(s: *Session, comptime kind: []const u8, text: []const u8) void {
         const old = s.deps.inspector.orderedRemove(0);
         s.gpa.free(old.text);
     }
-    s.deps.inspector.append(s.gpa, .{ .kind = kind, .text = text }) catch {
+    s.deps.insp_seq += 1;
+    s.deps.inspector.append(s.gpa, .{ .seq = s.deps.insp_seq, .kind = kind, .text = text }) catch {
         s.gpa.free(text);
     };
 }
@@ -773,6 +781,10 @@ fn applyEv(s: *Session, mb: *state.Mailbox, ev: state.Ev) bool {
             note(s, "sse", r);
             return true;
         },
+        .req => |r| {
+            note(s, "req", r);
+            return true;
+        },
         .models => |ids| {
             const copy = g.alloc([]const u8, ids.len) catch @panic("OOM");
             for (ids, copy) |id, *dst| dst.* = state.dupe(g, id);
@@ -837,8 +849,8 @@ fn applyEv(s: *Session, mb: *state.Mailbox, ev: state.Ev) bool {
             endpointFmt(s, .err, "{s}", .{e});
             return true;
         },
-        // .raw/.models returned early above — unreachable here.
-        .raw, .models => unreachable,
+        // .raw/.req/.models returned early above — unreachable here.
+        .raw, .req, .models => unreachable,
     }
 }
 
