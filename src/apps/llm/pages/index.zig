@@ -273,8 +273,9 @@ fn chatRow(a: std.mem.Allocator, s: *Session, c: *state.Conversation) ?forest.No
     while (i < s.deps.convs.items.len) : (i += 1) {
         if (s.deps.convs.items[i] == c) break;
     }
-    var ib: [16]u8 = undefined;
-    const arg = std.fmt.bufPrint(&ib, "{d}", .{i}) catch unreachable;
+    // h.f arena-allocates — a stack bufPrint slice would dangle once
+    // chatRow returns (forest stores the borrowed pointer).
+    const arg = h.f(a, "{d}", .{i});
     const active = s.deps.active == i;
     return h.li(a)
         .id(h.f(a, "chat-{d}", .{i}))

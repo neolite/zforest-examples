@@ -27,6 +27,12 @@ const Ping = struct {};
 /// session configs start with it so `ZLLM_API_KEY=… zllm` works
 /// out of the box. Never rendered back into HTML.
 var env_api_key: []const u8 = "";
+var env_base_url: []const u8 = "";
+
+/// `ZLLM_API_ENDPOINT` (or .env) seeds every session's base_url.
+pub fn setEnvEndpoint(url: []const u8) void {
+    env_base_url = url;
+}
 
 pub fn setEnvApiKey(key: []const u8) void {
     env_api_key = key;
@@ -106,6 +112,9 @@ pub const LlmDeps = struct {
         if (env_api_key.len != 0) {
             d.cfg.api_key = state.dupe(g, env_api_key);
             d.key_from_env = true;
+        }
+        if (env_base_url.len != 0) {
+            d.cfg.base_url = state.dupe(g, env_base_url);
         }
         d.convs.append(g, state.convNew(g, "Chat 1")) catch @panic("OOM");
         return d;
