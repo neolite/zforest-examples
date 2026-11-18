@@ -66,6 +66,13 @@ pub const builtins = [_]Builtin{
         \\{"type":"object","properties":{"code":{"type":"integer"}},"required":["code"]}
         ,
     },
+    .{
+        .name = "bash",
+        .description = "Run a shell command via sh -c; stdout+stderr merged (64KB cap). UNSANDBOXED local execution — runs synchronously, keep commands short; timeout_ms optional (default 20000, max 120000).",
+        .parameters_json =
+        \\{"type":"object","properties":{"command":{"type":"string","description":"Shell command line"},"timeout_ms":{"type":"integer","description":"Max run time in ms"}},"required":["command"]}
+        ,
+    },
 };
 
 pub fn builtinDef(gpa: std.mem.Allocator, name: []const u8) ?[]const u8 {
@@ -487,7 +494,88 @@ fn execBuiltin(gpa: std.mem.Allocator, io: Io, name: []const u8, args_json: []co
         };
         return std.fmt.allocPrint(gpa, "HTTP {d} {s}", .{ @as(i64, @intFromFloat(code)), reason }) catch @panic("OOM");
     }
+    if (std.mem.eql(u8, name, "bash")) return execBash(gpa, io, obj);
     return std.fmt.allocPrint(gpa, "error: unknown builtin tool '{s}'", .{name}) catch @panic("OOM");
+}
+
+/// `bash` builtin: spawn `sh -c <command>` with piped stdout+stderr,
+/// drain both with a poll deadline, kill on timeout. Synchronous —
+/// the caller (session drain) blocks for the command's duration.
+fn execBash(gpa: std.mem.Allocator, io: Io, obj: ?std.json.ObjectMap) []const u8 {
+    const cmd = argStr(obj, "command") orelse return dupeStr(gpa, "error: missing 'command' arg");
+    if (cmd.len == 0 or cmd.len > 4000) return dupeStr(gpa, "error: command empty or too long");
+    var timeout_ms: u64 = 20000;
+    if (argF64(obj, "timeout_ms")) |t| {
+        if (t > 0 and t <= 120000) timeout_ms = @intFromFloat(t);
+    }
+    const argv = [_][]const u8{ "sh", "-c", cmd };
+    var child = std.process.spawn(io, .{
+        .argv = &argv,
+        .stdin = .ignore,
+        .stdout = .pipe,
+        .stderr = .pipe,
+    }) catch return dupeStr(gpa, "error: spawn failed");
+    defer child.kill(io); // idempotent — reaps if still running
+
+    const so = child.stdout orelse return dupeStr(gpa, "error: no stdout pipe");
+    const se = child.stderr orelse return dupeStr(gpa, "error: no stderr pipe");
+    const fds_in = [_]std.posix.fd_t{ so.handle, se.handle };
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(gpa);
+    const CAP: usize = 64 * 1024;
+    var eof = [_]bool{ false, false };
+    var timed_out = false;
+    const start_ts = Io.Clock.real.now(io);
+    var chunk: [8192]u8 = undefined;
+    while (!eof[0] or !eof[1]) {
+        if (Io.Clock.real.now(io).toMilliseconds() - start_ts.toMilliseconds() >= @as(i64, @intCast(timeout_ms))) {
+            timed_out = true;
+            break;
+        }
+        var pfds = [_]std.posix.pollfd{
+            .{ .fd = fds_in[0], .events = if (eof[0]) 0 else std.posix.POLL.IN, .revents = 0 },
+            .{ .fd = fds_in[1], .events = if (eof[1]) 0 else std.posix.POLL.IN, .revents = 0 },
+        };
+        _ = std.posix.poll(&pfds, 100) catch break;
+        for (pfds, 0..) |pfd, i| {
+            if (pfd.revents == 0) continue;
+            if (pfd.revents & (std.posix.POLL.ERR | std.posix.POLL.NVAL) != 0) {
+                eof[i] = true;
+                continue;
+            }
+            const n = std.posix.read(fds_in[i], &chunk) catch {
+                eof[i] = true;
+                continue;
+            };
+            if (n == 0) {
+                eof[i] = true;
+                continue;
+            }
+            if (out.items.len < CAP) {
+                const room = CAP - out.items.len;
+                out.appendSlice(gpa, chunk[0..@min(n, room)]) catch @panic("OOM");
+            }
+        }
+    }
+    const term = if (timed_out) blk: {
+        child.kill(io);
+        break :blk null;
+    } else child.wait(io) catch null;
+
+    var result: std.ArrayListUnmanaged(u8) = .empty;
+    defer result.deinit(gpa);
+    result.appendSlice(gpa, out.items) catch @panic("OOM");
+    if (timed_out) {
+        result.appendSlice(gpa, "\n[timeout — process killed]") catch @panic("OOM");
+    } else if (term) |t| {
+        switch (t) {
+            .exited => |code| result.print(gpa, "\n[exit {d}]", .{code}) catch @panic("OOM"),
+            .signal => |sig| result.print(gpa, "\n[killed by signal {t}]", .{sig}) catch @panic("OOM"),
+            else => {},
+        }
+    }
+    if (result.items.len == 0) result.appendSlice(gpa, "(no output)") catch @panic("OOM");
+    return result.toOwnedSlice(gpa) catch @panic("OOM");
 }
 
 fn dupeStr(gpa: std.mem.Allocator, s: []const u8) []const u8 {
@@ -578,4 +666,18 @@ test "builtinDef emits function object for known names" {
     defer gpa.free(j);
     try std.testing.expect(std.mem.indexOf(u8, j, "\"name\":\"calculator\"") != null);
     try std.testing.expect(builtinDef(gpa, "nope") == null);
+}
+
+test "exec bash runs a command and captures output" {
+    const gpa = std.testing.allocator;
+    var d: ToolDef = .{ .name = "bash", .exec = .builtin };
+    const r = exec(gpa, std.testing.io, &d, "{\"command\":\"echo hi && echo err >&2; exit 3\",\"timeout_ms\":5000}");
+    defer gpa.free(r);
+    try std.testing.expect(std.mem.indexOf(u8, r, "hi") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r, "err") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r, "exit 3") != null);
+    // timeout kills long commands
+    const r2 = exec(gpa, std.testing.io, &d, "{\"command\":\"sleep 30\",\"timeout_ms\":300}");
+    defer gpa.free(r2);
+    try std.testing.expect(std.mem.indexOf(u8, r2, "timeout") != null);
 }
