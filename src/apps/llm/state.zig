@@ -67,6 +67,10 @@ pub const Msg = struct {
 
 pub const ToolMode = enum { off, manual, auto };
 
+/// chat = playground console; code = coding agent (file/process
+/// tools auto-attached, workspace-scoped).
+pub const AgentMode = enum { chat, code };
+
 /// Endpoint + generation config — every field gpa-owned (duped on
 /// set, freed on replace/deinit).
 pub const Config = struct {
@@ -80,6 +84,10 @@ pub const Config = struct {
     /// Context-window size for the fill meter (tokens).
     context_window: u32 = 64000,
     tool_mode: ToolMode = .manual,
+    agent_mode: AgentMode = .chat,
+    /// Code-mode root: file/process tools are confined to this dir.
+    /// Empty → process cwd, unrestricted.
+    workspace: []const u8 = "",
     /// Raw JSON array of user tool defs (validated on set).
     tools_json: []const u8 = "",
     /// Raw JSON array of MCP server configs (validated on set).

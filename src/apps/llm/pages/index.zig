@@ -189,11 +189,23 @@ fn sideBar(a: std.mem.Allocator, s: *Session) forest.Node {
                         h.option(a).id("tm-manual").value("manual").attr("selected", s.deps.cfg.tool_mode == .manual).child("manual (approve)").node(),
                         h.option(a).id("tm-auto").value("auto").attr("selected", s.deps.cfg.tool_mode == .auto).child("auto").node(),
                     }).node()),
+                field(a, "Mode", h.select(a)
+                    .on(.change, act.cfg_agent_mode)
+                    .child(.{
+                        h.option(a).id("am-chat").value("chat").attr("selected", s.deps.cfg.agent_mode == .chat).child("chat").node(),
+                        h.option(a).id("am-code").value("code").attr("selected", s.deps.cfg.agent_mode == .code).child("code (agent)").node(),
+                    }).node()),
+                field(a, "Workspace", h.input(a)
+                    .id("cfg-workspace")
+                    .class("mono")
+                    .placeholder("/abs/path or relative — code mode root")
+                    .value(s.deps.cfg.workspace)
+                    .on(.change, act.cfg_workspace).node()),
             }).node(),
         }).node(),
         h.section(a).class("card").children(.{
             h.h2(a).child("Tools (JSON)").node(),
-            h.p(a).class("hint").child("OpenAI tools array. \"exec\":\"builtin\" runs a builtin (calculator, datetime_now, echo, word_count, uuid, random_number, http_status…); otherwise mock. \"builtin\":\"name\" aliases the wire name.").node(),
+            h.p(a).class("hint").child("OpenAI tools array. \"exec\":\"builtin\" runs a builtin (calculator, datetime_now, echo, word_count, uuid4, http_status, bash…); otherwise mock. Code mode auto-attaches read_file/write_file/edit_file/list_dir/grep_files/bash + proc_start/output/list/kill scoped to Workspace.").node(),
             h.textarea(a)
                 .id("cfg-tools")
                 .class("mono tools-json")

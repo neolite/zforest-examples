@@ -18,6 +18,8 @@ pub const actions = .{
     "cfg_top_p",
     "cfg_context_window",
     "cfg_tool_mode",
+    "cfg_agent_mode",
+    "cfg_workspace",
     "cfg_tools_json",
     "set_preset",
     "fetch_models",

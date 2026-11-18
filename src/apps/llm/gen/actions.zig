@@ -22,6 +22,8 @@ pub const act = struct {
     pub const cfg_top_p = "cfg_top_p";
     pub const cfg_context_window = "cfg_context_window";
     pub const cfg_tool_mode = "cfg_tool_mode";
+    pub const cfg_agent_mode = "cfg_agent_mode";
+    pub const cfg_workspace = "cfg_workspace";
     pub const cfg_tools_json = "cfg_tools_json";
     pub const set_preset = "set_preset";
     pub const fetch_models = "fetch_models";
@@ -60,6 +62,8 @@ pub fn dispatch(
     if (std.mem.eql(u8, action, act.cfg_top_p)) return D.on_cfg_top_p(s, arg, value, fields);
     if (std.mem.eql(u8, action, act.cfg_context_window)) return D.on_cfg_context_window(s, arg, value, fields);
     if (std.mem.eql(u8, action, act.cfg_tool_mode)) return D.on_cfg_tool_mode(s, arg, value, fields);
+    if (std.mem.eql(u8, action, act.cfg_agent_mode)) return D.on_cfg_agent_mode(s, arg, value, fields);
+    if (std.mem.eql(u8, action, act.cfg_workspace)) return D.on_cfg_workspace(s, arg, value, fields);
     if (std.mem.eql(u8, action, act.cfg_tools_json)) return D.on_cfg_tools_json(s, arg, value, fields);
     if (std.mem.eql(u8, action, act.set_preset)) return D.on_set_preset(s, arg, value, fields);
     if (std.mem.eql(u8, action, act.fetch_models)) return D.on_fetch_models(s, arg, value, fields);

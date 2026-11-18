@@ -73,7 +73,93 @@ pub const builtins = [_]Builtin{
         \\{"type":"object","properties":{"command":{"type":"string","description":"Shell command line"},"timeout_ms":{"type":"integer","description":"Max run time in ms"}},"required":["command"]}
         ,
     },
+    // ── code-mode tools (auto-attached when agent_mode == .code) ──
+    .{
+        .name = "read_file",
+        .description = "Read a text file from the workspace. Returns numbered lines; use start_line/max_lines for large files.",
+        .parameters_json =
+        \\{"type":"object","properties":{"path":{"type":"string","description":"Path relative to workspace root"},"start_line":{"type":"integer","description":"1-based first line, default 1"},"max_lines":{"type":"integer","description":"Max lines, default 400"}},"required":["path"]}
+        ,
+    },
+    .{
+        .name = "write_file",
+        .description = "Write a whole file (creates parent dirs). Overwrites existing content — use edit_file for surgical changes.",
+        .parameters_json =
+        \\{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}
+        ,
+    },
+    .{
+        .name = "edit_file",
+        .description = "Replace an exact string in a file. old_string must match uniquely unless replace_all is true.",
+        .parameters_json =
+        \\{"type":"object","properties":{"path":{"type":"string"},"old_string":{"type":"string"},"new_string":{"type":"string"},"replace_all":{"type":"boolean"}},"required":["path","old_string","new_string"]}
+        ,
+    },
+    .{
+        .name = "list_dir",
+        .description = "List directory entries (dirs marked with /). Defaults to workspace root.",
+        .parameters_json =
+        \\{"type":"object","properties":{"path":{"type":"string","description":"Subdir relative to workspace, default root"}}}
+        ,
+    },
+    .{
+        .name = "grep_files",
+        .description = "Recursive substring search over text files. Returns path:line: text matches (max 100). Skips binary and >512KB files.",
+        .parameters_json =
+        \\{"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string","description":"Subdir to search, default workspace root"},"ignore_case":{"type":"boolean"}},"required":["pattern"]}
+        ,
+    },
+    // ── background process tools (session-backed, code mode) ──
+    .{
+        .name = "proc_start",
+        .description = "Start a BACKGROUND shell command (sh -c) in the workspace. Returns a proc id — read output with proc_output, stop with proc_kill. Use for dev servers, watchers, long test runs.",
+        .parameters_json =
+        \\{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}
+        ,
+    },
+    .{
+        .name = "proc_output",
+        .description = "Read NEW output (merged stdout+stderr) from a background process plus its status.",
+        .parameters_json =
+        \\{"type":"object","properties":{"id":{"type":"integer","description":"Proc id from proc_start"}},"required":["id"]}
+        ,
+    },
+    .{
+        .name = "proc_list",
+        .description = "List background processes with status and command line.",
+        .parameters_json =
+        \\{"type":"object","properties":{}}
+        ,
+    },
+    .{
+        .name = "proc_kill",
+        .description = "Kill a background process by id.",
+        .parameters_json =
+        \\{"type":"object","properties":{"id":{"type":"integer"}},"required":["id"]}
+        ,
+    },
 };
+
+/// Builtin names auto-attached to requests in code mode (agent_mode
+/// == .code). Order = payload order.
+pub const code_tool_names = [_][]const u8{
+    "bash",       "read_file",   "write_file", "edit_file", "list_dir", "grep_files",
+    "proc_start", "proc_output", "proc_list",  "proc_kill",
+};
+
+/// True when `name` is a session-backed proc_* tool — app.zig routes
+/// these to the process table instead of tools.exec.
+pub fn isProcTool(name: []const u8) bool {
+    return std.mem.startsWith(u8, name, "proc_");
+}
+
+/// True when `name` exists in the builtin catalog.
+pub fn builtinExists(name: []const u8) bool {
+    for (builtins) |b| {
+        if (std.mem.eql(u8, b.name, name)) return true;
+    }
+    return false;
+}
 
 pub fn builtinDef(gpa: std.mem.Allocator, name: []const u8) ?[]const u8 {
     for (builtins) |b| {
@@ -246,7 +332,7 @@ pub fn defsToToolsJson(gpa: std.mem.Allocator, defs: []const ToolDef) []const u8
 /// absent/non-string). Slices stay valid while the caller's
 /// `Parsed(Value)` lives — execBuiltin parses args_json ONCE and
 /// keeps it alive for the whole dispatch.
-fn argStr(obj: ?std.json.ObjectMap, name: []const u8) ?[]const u8 {
+pub fn argStr(obj: ?std.json.ObjectMap, name: []const u8) ?[]const u8 {
     const o = obj orelse return null;
     const v = o.get(name) orelse return null;
     return switch (v) {
@@ -255,7 +341,7 @@ fn argStr(obj: ?std.json.ObjectMap, name: []const u8) ?[]const u8 {
     };
 }
 
-fn argF64(obj: ?std.json.ObjectMap, name: []const u8) ?f64 {
+pub fn argF64(obj: ?std.json.ObjectMap, name: []const u8) ?f64 {
     const o = obj orelse return null;
     const v = o.get(name) orelse return null;
     return switch (v) {
@@ -389,8 +475,9 @@ fn fmtNum(gpa: std.mem.Allocator, v: f64) []const u8 {
 
 /// Execute a resolved tool call. Returns gpa-owned result text (never
 /// an error union — failures become descriptive result strings so the
-/// model can react to them, matching real tool semantics).
-pub fn exec(gpa: std.mem.Allocator, io: Io, def: *const ToolDef, args_json: []const u8) []const u8 {
+/// model can react to them, matching real tool semantics). `workspace`
+/// is the code-mode root confining file/process tools ("" → cwd).
+pub fn exec(gpa: std.mem.Allocator, io: Io, def: *const ToolDef, args_json: []const u8, workspace: []const u8) []const u8 {
     if (def.exec == .mock) {
         // {args} → raw arguments JSON substitution.
         var out: std.ArrayListUnmanaged(u8) = .empty;
@@ -408,10 +495,10 @@ pub fn exec(gpa: std.mem.Allocator, io: Io, def: *const ToolDef, args_json: []co
         return out.toOwnedSlice(gpa) catch @panic("OOM");
     }
     // builtin — `builtin_name` aliases the wire name to a builtin.
-    return execBuiltin(gpa, io, def.builtin_name orelse def.name, args_json);
+    return execBuiltin(gpa, io, def.builtin_name orelse def.name, args_json, workspace);
 }
 
-fn execBuiltin(gpa: std.mem.Allocator, io: Io, name: []const u8, args_json: []const u8) []const u8 {
+fn execBuiltin(gpa: std.mem.Allocator, io: Io, name: []const u8, args_json: []const u8, workspace: []const u8) []const u8 {
     // Parse args ONCE — argStr/argF64 return slices into this tree,
     // valid until the deferred deinit at function exit.
     var parsed = std.json.parseFromSlice(std.json.Value, gpa, args_json, .{}) catch null;
@@ -494,14 +581,20 @@ fn execBuiltin(gpa: std.mem.Allocator, io: Io, name: []const u8, args_json: []co
         };
         return std.fmt.allocPrint(gpa, "HTTP {d} {s}", .{ @as(i64, @intFromFloat(code)), reason }) catch @panic("OOM");
     }
-    if (std.mem.eql(u8, name, "bash")) return execBash(gpa, io, obj);
+    if (std.mem.eql(u8, name, "bash")) return execBash(gpa, io, obj, workspace);
+    if (std.mem.eql(u8, name, "read_file")) return execReadFile(gpa, io, obj, workspace);
+    if (std.mem.eql(u8, name, "write_file")) return execWriteFile(gpa, io, obj, workspace);
+    if (std.mem.eql(u8, name, "edit_file")) return execEditFile(gpa, io, obj, workspace);
+    if (std.mem.eql(u8, name, "list_dir")) return execListDir(gpa, io, obj, workspace);
+    if (std.mem.eql(u8, name, "grep_files")) return execGrep(gpa, io, obj, workspace);
+    if (isProcTool(name)) return dupeStr(gpa, "error: process tools need an active code-mode session");
     return std.fmt.allocPrint(gpa, "error: unknown builtin tool '{s}'", .{name}) catch @panic("OOM");
 }
 
 /// `bash` builtin: spawn `sh -c <command>` with piped stdout+stderr,
 /// drain both with a poll deadline, kill on timeout. Synchronous —
 /// the caller (session drain) blocks for the command's duration.
-fn execBash(gpa: std.mem.Allocator, io: Io, obj: ?std.json.ObjectMap) []const u8 {
+fn execBash(gpa: std.mem.Allocator, io: Io, obj: ?std.json.ObjectMap, workspace: []const u8) []const u8 {
     const cmd = argStr(obj, "command") orelse return dupeStr(gpa, "error: missing 'command' arg");
     if (cmd.len == 0 or cmd.len > 4000) return dupeStr(gpa, "error: command empty or too long");
     var timeout_ms: u64 = 20000;
@@ -514,6 +607,7 @@ fn execBash(gpa: std.mem.Allocator, io: Io, obj: ?std.json.ObjectMap) []const u8
         .stdin = .ignore,
         .stdout = .pipe,
         .stderr = .pipe,
+        .cwd = if (workspace.len != 0) .{ .path = workspace } else .inherit,
     }) catch return dupeStr(gpa, "error: spawn failed");
     defer child.kill(io); // idempotent — reaps if still running
 
@@ -582,6 +676,252 @@ fn dupeStr(gpa: std.mem.Allocator, s: []const u8) []const u8 {
     return state.dupe(gpa, s);
 }
 
+fn errResult(gpa: std.mem.Allocator, comptime fmt: []const u8, args: anytype) []const u8 {
+    return std.fmt.allocPrint(gpa, "error: " ++ fmt, args) catch @panic("OOM");
+}
+
+pub fn argBool(obj: ?std.json.ObjectMap, name: []const u8) bool {
+    const o = obj orelse return false;
+    const v = o.get(name) orelse return false;
+    return switch (v) {
+        .bool => |b| b,
+        else => false,
+    };
+}
+
+// ── code-mode file tools ─────────────────────────────────────────
+
+/// Resolve a tool `path` arg to an absolute normalized path confined
+/// to `workspace` (process cwd when workspace is ""). Empty `path`
+/// yields the workspace root itself. Returns a gpa-owned slice, or
+/// null on escape/invalid input — `..` is collapsed by
+/// `fs.path.resolveAlloc` BEFORE the prefix check, so traversal
+/// outside the root is rejected.
+fn resolveToolPath(gpa: std.mem.Allocator, io: Io, workspace: []const u8, path: []const u8) ?[]u8 {
+    if (path.len > 4096) return null;
+    if (std.mem.indexOfScalar(u8, path, 0) != null) return null;
+    const cwd = std.process.currentPathAlloc(io, gpa) catch return null;
+    defer gpa.free(cwd);
+    const root = if (workspace.len != 0)
+        (std.fs.path.resolveAlloc(gpa, &.{ cwd, workspace }) catch return null)
+    else
+        (gpa.dupe(u8, cwd) catch return null);
+    defer gpa.free(root);
+    if (path.len == 0) return gpa.dupe(u8, root) catch null;
+    const target = std.fs.path.resolveAlloc(gpa, &.{ root, path }) catch return null;
+    var prefix_buf: [4200]u8 = undefined;
+    const prefix = if (root.len > 0 and root[root.len - 1] == '/')
+        root
+    else
+        std.fmt.bufPrint(&prefix_buf, "{s}/", .{root}) catch {
+            gpa.free(target);
+            return null;
+        };
+    const inside = std.mem.eql(u8, target, root) or std.mem.startsWith(u8, target, prefix);
+    if (!inside) {
+        gpa.free(target);
+        return null;
+    }
+    return target;
+}
+
+fn execReadFile(gpa: std.mem.Allocator, io: Io, obj: ?std.json.ObjectMap, workspace: []const u8) []const u8 {
+    const path = argStr(obj, "path") orelse return errResult(gpa, "missing 'path' arg", .{});
+    const abs = resolveToolPath(gpa, io, workspace, path) orelse
+        return errResult(gpa, "invalid path or escapes workspace: '{s}'", .{path});
+    defer gpa.free(abs);
+    const data = std.Io.Dir.cwd().readFileAlloc(io, abs, gpa, .limited(2 * 1024 * 1024)) catch |e|
+        return errResult(gpa, "read failed: {s}", .{@errorName(e)});
+    defer gpa.free(data);
+    const probe = data[0..@min(data.len, 8192)];
+    if (std.mem.indexOfScalar(u8, probe, 0) != null) return dupeStr(gpa, "error: binary file");
+
+    var start: usize = 1;
+    if (argF64(obj, "start_line")) |v| {
+        if (v >= 1 and v <= 1_000_000) start = @intFromFloat(v);
+    }
+    var max_lines: usize = 400;
+    if (argF64(obj, "max_lines")) |v| {
+        if (v >= 1 and v <= 5000) max_lines = @intFromFloat(v);
+    }
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(gpa);
+    var line_no: usize = 0;
+    var shown: usize = 0;
+    var truncated = false;
+    var lines = std.mem.splitScalar(u8, data, '\n');
+    while (lines.next()) |raw| {
+        line_no += 1;
+        if (line_no < start) continue;
+        if (shown >= max_lines) {
+            truncated = true;
+            break;
+        }
+        const line = std.mem.trimEnd(u8, raw, "\r");
+        out.print(gpa, "{d}: {s}\n", .{ line_no, line }) catch @panic("OOM");
+        shown += 1;
+    }
+    if (truncated) out.appendSlice(gpa, "[truncated — use start_line/max_lines]\n") catch @panic("OOM");
+    if (shown == 0) return errResult(gpa, "no lines in range (file has {d})", .{line_no});
+    return out.toOwnedSlice(gpa) catch @panic("OOM");
+}
+
+fn execWriteFile(gpa: std.mem.Allocator, io: Io, obj: ?std.json.ObjectMap, workspace: []const u8) []const u8 {
+    const path = argStr(obj, "path") orelse return errResult(gpa, "missing 'path' arg", .{});
+    const content = argStr(obj, "content") orelse return errResult(gpa, "missing 'content' arg", .{});
+    if (content.len > 512 * 1024) return dupeStr(gpa, "error: content exceeds 512KB");
+    const abs = resolveToolPath(gpa, io, workspace, path) orelse
+        return errResult(gpa, "invalid path or escapes workspace: '{s}'", .{path});
+    defer gpa.free(abs);
+    if (std.fs.path.dirname(abs)) |dir| {
+        std.Io.Dir.cwd().createDirPath(io, dir) catch {};
+    }
+    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = abs, .data = content }) catch |e|
+        return errResult(gpa, "write failed: {s}", .{@errorName(e)});
+    return std.fmt.allocPrint(gpa, "wrote {d} bytes to {s}", .{ content.len, path }) catch @panic("OOM");
+}
+
+fn execEditFile(gpa: std.mem.Allocator, io: Io, obj: ?std.json.ObjectMap, workspace: []const u8) []const u8 {
+    const path = argStr(obj, "path") orelse return errResult(gpa, "missing 'path' arg", .{});
+    const old = argStr(obj, "old_string") orelse return errResult(gpa, "missing 'old_string' arg", .{});
+    const new = argStr(obj, "new_string") orelse return errResult(gpa, "missing 'new_string' arg", .{});
+    if (old.len == 0) return dupeStr(gpa, "error: old_string is empty");
+    const abs = resolveToolPath(gpa, io, workspace, path) orelse
+        return errResult(gpa, "invalid path or escapes workspace: '{s}'", .{path});
+    defer gpa.free(abs);
+    const data = std.Io.Dir.cwd().readFileAlloc(io, abs, gpa, .limited(2 * 1024 * 1024)) catch |e|
+        return errResult(gpa, "read failed: {s}", .{@errorName(e)});
+    defer gpa.free(data);
+
+    var count: usize = 0;
+    var pos: usize = 0;
+    while (std.mem.indexOfPos(u8, data, pos, old)) |idx| {
+        count += 1;
+        pos = idx + old.len;
+    }
+    if (count == 0) return errResult(gpa, "old_string not found in {s}", .{path});
+    const all = argBool(obj, "replace_all");
+    if (count > 1 and !all) {
+        return std.fmt.allocPrint(gpa, "error: old_string occurs {d} times in {s} — add more context or set replace_all", .{ count, path }) catch @panic("OOM");
+    }
+    // Build replaced content.
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(gpa);
+    var cur: usize = 0;
+    var replaced: usize = 0;
+    while (std.mem.indexOfPos(u8, data, cur, old)) |idx| {
+        out.appendSlice(gpa, data[cur..idx]) catch @panic("OOM");
+        out.appendSlice(gpa, new) catch @panic("OOM");
+        cur = idx + old.len;
+        replaced += 1;
+        if (!all) break;
+    }
+    out.appendSlice(gpa, data[cur..]) catch @panic("OOM");
+    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = abs, .data = out.items }) catch |e|
+        return errResult(gpa, "write failed: {s}", .{@errorName(e)});
+    return std.fmt.allocPrint(gpa, "edited {s}: replaced {d} occurrence(s)", .{ path, replaced }) catch @panic("OOM");
+}
+
+fn execListDir(gpa: std.mem.Allocator, io: Io, obj: ?std.json.ObjectMap, workspace: []const u8) []const u8 {
+    const path = argStr(obj, "path") orelse "";
+    const abs = resolveToolPath(gpa, io, workspace, path) orelse
+        return errResult(gpa, "invalid path or escapes workspace: '{s}'", .{path});
+    defer gpa.free(abs);
+    var dir = std.Io.Dir.cwd().openDir(io, abs, .{ .iterate = true }) catch |e|
+        return errResult(gpa, "open dir failed: {s}", .{@errorName(e)});
+    defer dir.close(io);
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(gpa);
+    var it = dir.iterate();
+    var n: usize = 0;
+    var truncated = false;
+    while (it.next(io) catch null) |entry| {
+        if (n >= 500) {
+            truncated = true;
+            break;
+        }
+        const suffix: []const u8 = if (entry.kind == .directory) "/" else "";
+        out.print(gpa, "{s}{s}\n", .{ entry.name, suffix }) catch @panic("OOM");
+        n += 1;
+    }
+    if (truncated) out.appendSlice(gpa, "[truncated at 500 entries]\n") catch @panic("OOM");
+    if (n == 0) return dupeStr(gpa, "(empty directory)");
+    return out.toOwnedSlice(gpa) catch @panic("OOM");
+}
+
+const skip_dirs = [_][]const u8{ ".git", "node_modules", ".zig-cache", "zig-out", ".next", "dist" };
+
+fn execGrep(gpa: std.mem.Allocator, io: Io, obj: ?std.json.ObjectMap, workspace: []const u8) []const u8 {
+    const pattern = argStr(obj, "pattern") orelse return errResult(gpa, "missing 'pattern' arg", .{});
+    if (pattern.len == 0 or pattern.len > 200) return dupeStr(gpa, "error: pattern empty or too long");
+    const path = argStr(obj, "path") orelse "";
+    const abs = resolveToolPath(gpa, io, workspace, path) orelse
+        return errResult(gpa, "invalid path or escapes workspace: '{s}'", .{path});
+    defer gpa.free(abs);
+    var dir = std.Io.Dir.cwd().openDir(io, abs, .{ .iterate = true }) catch |e|
+        return errResult(gpa, "open dir failed: {s}", .{@errorName(e)});
+    defer dir.close(io);
+    var walker = dir.walk(gpa) catch return errResult(gpa, "walk failed", .{});
+    defer walker.deinit();
+
+    const ignore_case = argBool(obj, "ignore_case");
+    var needle_buf: [201]u8 = undefined;
+    const needle = if (ignore_case) blk: {
+        if (pattern.len > needle_buf.len) return dupeStr(gpa, "error: pattern too long");
+        const n = std.ascii.lowerString(&needle_buf, pattern);
+        break :blk n;
+    } else pattern;
+    var hay_buf: [201]u8 = undefined;
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(gpa);
+    var matches: usize = 0;
+    var scanned: usize = 0;
+    var truncated = false;
+    while (walker.next(io) catch null) |entry| {
+        if (matches >= 100 or scanned >= 3000) {
+            truncated = true;
+            break;
+        }
+        if (entry.kind == .directory) {
+            for (skip_dirs) |sd| {
+                if (std.mem.eql(u8, entry.basename, sd)) {
+                    walker.leave(io);
+                    break;
+                }
+            }
+            continue;
+        }
+        if (entry.kind != .file) continue;
+        scanned += 1;
+        const fdata = entry.dir.readFileAlloc(io, entry.basename, gpa, .limited(512 * 1024 + 1)) catch continue;
+        defer gpa.free(fdata);
+        if (fdata.len > 512 * 1024) continue;
+        if (std.mem.indexOfScalar(u8, fdata[0..@min(fdata.len, 8192)], 0) != null) continue;
+        var line_no: usize = 0;
+        var lines = std.mem.splitScalar(u8, fdata, '\n');
+        while (lines.next()) |raw| {
+            line_no += 1;
+            const line = std.mem.trimEnd(u8, raw, "\r");
+            const hay = if (ignore_case and line.len <= hay_buf.len) blk: {
+                break :blk std.ascii.lowerString(&hay_buf, line);
+            } else line;
+            const hit = if (ignore_case)
+                (hay.len >= needle.len and std.mem.indexOf(u8, hay, needle) != null)
+            else
+                std.mem.indexOf(u8, line, pattern) != null;
+            if (!hit) continue;
+            const short = line[0..@min(line.len, 200)];
+            out.print(gpa, "{s}:{d}: {s}\n", .{ entry.path, line_no, short }) catch @panic("OOM");
+            matches += 1;
+            if (matches >= 100) break;
+        }
+    }
+    if (truncated) out.appendSlice(gpa, "[truncated — narrow the search path/pattern]\n") catch @panic("OOM");
+    if (matches == 0) return dupeStr(gpa, "no matches");
+    return out.toOwnedSlice(gpa) catch @panic("OOM");
+}
+
 // Howard Hinnant's civil-from-days — proleptic Gregorian, UTC.
 fn civilFromDays(z: i64) struct { i64, u32, u32 } {
     const zz = z + 719468;
@@ -646,16 +986,16 @@ test "defsToToolsJson emits OpenAI tools array" {
 test "exec mock substitutes {args}, builtin calculator works" {
     const gpa = std.testing.allocator;
     var mock: ToolDef = .{ .name = "m", .exec = .mock, .result_template = "got {args}" };
-    const r1 = exec(gpa, std.testing.io, &mock, "{\"a\":1}");
+    const r1 = exec(gpa, std.testing.io, &mock, "{\"a\":1}", "");
     defer gpa.free(r1);
     try std.testing.expectEqualStrings("got {\"a\":1}", r1);
 
     var calc: ToolDef = .{ .name = "calculator", .exec = .builtin };
-    const r2 = exec(gpa, std.testing.io, &calc, "{\"expr\":\"2+3*4\"}");
+    const r2 = exec(gpa, std.testing.io, &calc, "{\"expr\":\"2+3*4\"}", "");
     defer gpa.free(r2);
     try std.testing.expectEqualStrings("14", r2);
 
-    const r3 = exec(gpa, std.testing.io, &calc, "{\"expr\":\"1/0\"}");
+    const r3 = exec(gpa, std.testing.io, &calc, "{\"expr\":\"1/0\"}", "");
     defer gpa.free(r3);
     try std.testing.expect(std.mem.startsWith(u8, r3, "error:"));
 }
@@ -671,13 +1011,57 @@ test "builtinDef emits function object for known names" {
 test "exec bash runs a command and captures output" {
     const gpa = std.testing.allocator;
     var d: ToolDef = .{ .name = "bash", .exec = .builtin };
-    const r = exec(gpa, std.testing.io, &d, "{\"command\":\"echo hi && echo err >&2; exit 3\",\"timeout_ms\":5000}");
+    const r = exec(gpa, std.testing.io, &d, "{\"command\":\"echo hi && echo err >&2; exit 3\",\"timeout_ms\":5000}", "");
     defer gpa.free(r);
     try std.testing.expect(std.mem.indexOf(u8, r, "hi") != null);
     try std.testing.expect(std.mem.indexOf(u8, r, "err") != null);
     try std.testing.expect(std.mem.indexOf(u8, r, "exit 3") != null);
     // timeout kills long commands
-    const r2 = exec(gpa, std.testing.io, &d, "{\"command\":\"sleep 30\",\"timeout_ms\":300}");
+    const r2 = exec(gpa, std.testing.io, &d, "{\"command\":\"sleep 30\",\"timeout_ms\":300}", "");
     defer gpa.free(r2);
     try std.testing.expect(std.mem.indexOf(u8, r2, "timeout") != null);
+}
+
+test "code file tools: write/read/edit/list/grep + workspace escape rejection" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const ws = ".zig-cache/zllm-tooltest";
+    std.Io.Dir.cwd().createDirPath(io, ws) catch unreachable;
+    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = ws ++ "/a.txt", .data = "alpha\nbeta\n" }) catch unreachable;
+
+    var d: ToolDef = .{ .name = "write_file", .exec = .builtin };
+    const w = exec(gpa, io, &d, "{\"path\":\"sub/b.txt\",\"content\":\"x\\ny\\n\"}", ws);
+    defer gpa.free(w);
+    try std.testing.expect(std.mem.indexOf(u8, w, "wrote") != null);
+
+    d.name = "read_file";
+    const r = exec(gpa, io, &d, "{\"path\":\"a.txt\"}", ws);
+    defer gpa.free(r);
+    try std.testing.expect(std.mem.indexOf(u8, r, "1: alpha") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r, "2: beta") != null);
+
+    d.name = "edit_file";
+    const e = exec(gpa, io, &d, "{\"path\":\"a.txt\",\"old_string\":\"beta\",\"new_string\":\"gamma\"}", ws);
+    defer gpa.free(e);
+    try std.testing.expect(std.mem.indexOf(u8, e, "replaced 1") != null);
+
+    d.name = "list_dir";
+    const l = exec(gpa, io, &d, "{}", ws);
+    defer gpa.free(l);
+    try std.testing.expect(std.mem.indexOf(u8, l, "a.txt") != null);
+    try std.testing.expect(std.mem.indexOf(u8, l, "sub/") != null);
+
+    d.name = "grep_files";
+    const g = exec(gpa, io, &d, "{\"pattern\":\"gamma\"}", ws);
+    defer gpa.free(g);
+    try std.testing.expect(std.mem.indexOf(u8, g, "a.txt:2: gamma") != null);
+
+    // escape attempts must be rejected
+    d.name = "read_file";
+    const esc = exec(gpa, io, &d, "{\"path\":\"../build.zig\"}", ws);
+    defer gpa.free(esc);
+    try std.testing.expect(std.mem.indexOf(u8, esc, "escapes workspace") != null);
+    const esc2 = exec(gpa, io, &d, "{\"path\":\"/etc/passwd\"}", ws);
+    defer gpa.free(esc2);
+    try std.testing.expect(std.mem.indexOf(u8, esc2, "escapes workspace") != null);
 }

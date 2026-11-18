@@ -77,6 +77,21 @@ pub const McpTool = struct {
     tools_json: []const u8,
 };
 
+/// A background process started by `proc_start` — stdout+stderr are
+/// merged into `out` (256KB cap), `pos` is the read cursor for
+/// `proc_output`. Reaped via `child.wait` once both pipes hit EOF.
+pub const Proc = struct {
+    id: u32,
+    cmd: []const u8,
+    child: *std.process.Child,
+    out: std.ArrayListUnmanaged(u8) = .empty,
+    pos: usize = 0,
+    eof: [2]bool = .{ false, false },
+    done: bool = false,
+    /// Exit code, or -1 when killed/signalled.
+    code: i32 = 0,
+};
+
 pub const LlmDeps = struct {
     pub const page_title = "zllm";
     pub const page_class = "app app-llm";
@@ -114,6 +129,9 @@ pub const LlmDeps = struct {
     /// In-flight MCP worker (check or tools/call) — separate from
     /// `mailbox` so a chat stream and an MCP call can overlap.
     mcp_mb: ?*state.Mailbox = null,
+    /// Code-mode background processes (proc_start/output/list/kill).
+    procs: std.ArrayListUnmanaged(Proc) = .empty,
+    proc_seq: u32 = 1,
 
     ping: *zefx.Event(Ping),
 
@@ -133,6 +151,8 @@ pub const LlmDeps = struct {
             .mcp_tools = .empty,
             .mcp_status = .{},
             .mcp_mb = null,
+            .procs = .empty,
+            .proc_seq = 1,
             .ping = s.app.createEvent(Ping),
         };
         // gpa-own every default so deinit can free uniformly.
@@ -184,6 +204,13 @@ pub const LlmDeps = struct {
         // send_queue entries are *Msg owned by their Conversation —
         // convFree already released them; only the list itself frees.
         s.deps.send_queue.deinit(g);
+        for (s.deps.procs.items) |*p| {
+            p.child.kill(s.io); // idempotent — no-op after wait
+            state.freeStr(g, p.cmd);
+            p.out.deinit(g);
+            g.destroy(p.child);
+        }
+        s.deps.procs.deinit(g);
     }
 
     pub fn wire(s: *Session) void {
@@ -360,6 +387,31 @@ pub const LlmDeps = struct {
         _ = fields;
         const v = value orelse return error.InvalidAction;
         s.deps.cfg.tool_mode = if (std.mem.eql(u8, v, "auto")) .auto else if (std.mem.eql(u8, v, "off")) .off else .manual;
+        s.deps.ping.emit(.{});
+    }
+    /// `cfg_agent_mode` — chat ↔ code toggle. Entering code mode with
+    /// an empty system prompt seeds the coding-agent preset.
+    pub fn on_cfg_agent_mode(s: *Session, arg: ?[]const u8, value: ?[]const u8, fields: ?*const std.json.ObjectMap) !void {
+        _ = arg;
+        _ = fields;
+        const v = value orelse return error.InvalidAction;
+        const m: state.AgentMode = if (std.mem.eql(u8, v, "code")) .code else .chat;
+        const was = s.deps.cfg.agent_mode;
+        s.deps.cfg.agent_mode = m;
+        if (m == .code and was != .code and s.deps.cfg.system.len == 0) {
+            if (presets.findSysprompt("coding_agent")) |p| {
+                state.setStr(s.gpa, &s.deps.cfg.system, p.text);
+            }
+        }
+        noteFmt(s, "sys", "mode: {s}", .{@tagName(m)});
+        s.deps.ping.emit(.{});
+    }
+    /// `cfg_workspace` — code-mode root for file/process tools.
+    pub fn on_cfg_workspace(s: *Session, arg: ?[]const u8, value: ?[]const u8, fields: ?*const std.json.ObjectMap) !void {
+        _ = arg;
+        _ = fields;
+        const v = value orelse return error.InvalidAction;
+        state.setStr(s.gpa, &s.deps.cfg.workspace, std.mem.trim(u8, v, " \t"));
         s.deps.ping.emit(.{});
     }
     pub fn on_cfg_tools_json(s: *Session, arg: ?[]const u8, value: ?[]const u8, fields: ?*const std.json.ObjectMap) !void {
@@ -665,8 +717,11 @@ fn toolsPayload(s: *Session) []const u8 {
     const emitInner = struct {
         fn f(wr: anytype, json: []const u8, count: *usize) void {
             const t = std.mem.trim(u8, json, " \t\r\n");
-            if (t.len < 2 or t[0] != '[' or t[t.len - 1] != ']') return;
-            const inner = std.mem.trim(u8, t[1 .. t.len - 1], " \t\r\n");
+            if (t.len == 0) return;
+            const inner = if (t.len >= 2 and t[0] == '[' and t[t.len - 1] == ']')
+                std.mem.trim(u8, t[1 .. t.len - 1], " \t\r\n")
+            else
+                t; // single object (builtinDef output)
             if (inner.len == 0) return;
             if (count.* != 0) wr.writeByte(',') catch @panic("OOM");
             wr.writeAll(inner) catch @panic("OOM");
@@ -677,6 +732,23 @@ fn toolsPayload(s: *Session) []const u8 {
         const uj = tools.defsToToolsJson(s.gpa, s.deps.tool_defs);
         defer s.gpa.free(uj);
         emitInner(w, uj, &n);
+    }
+    // Code mode: auto-attach file/bash/proc builtins the user didn't
+    // redefine in tools_json.
+    if (s.deps.cfg.agent_mode == .code) {
+        for (tools.code_tool_names) |name| {
+            var dup = false;
+            for (s.deps.tool_defs) |d| {
+                if (std.mem.eql(u8, d.name, name)) {
+                    dup = true;
+                    break;
+                }
+            }
+            if (dup) continue;
+            const def = tools.builtinDef(s.gpa, name) orelse continue;
+            emitInner(w, def, &n);
+            s.gpa.free(def);
+        }
     }
     for (s.deps.mcp_tools.items) |mt| {
         emitInner(w, mt.tools_json, &n);
@@ -918,12 +990,25 @@ fn resolveCall(s: *Session, am: *state.Msg, c: *state.ToolCall) void {
         }
     }
     if (def) |d| {
-        const res = tools.exec(g, s.io, &d, c.args_json.items);
+        const res = tools.exec(g, s.io, &d, c.args_json.items, s.deps.cfg.workspace);
+        c.result = res;
+        c.state = .done;
+        noteFmtIn(s, "tool", "{s}({s}) → {s}", .{ c.name, c.args_json.items, res }, convOfMsg(s, am));
+    } else if (tools.isProcTool(c.name)) {
+        const res = procExec(s, c.name, c.args_json.items);
         c.result = res;
         c.state = .done;
         noteFmtIn(s, "tool", "{s}({s}) → {s}", .{ c.name, c.args_json.items, res }, convOfMsg(s, am));
     } else if (mcp.parseWireName(c.name)) |mt| {
         resolveCallMcp(s, am, c, mt.server, mt.tool);
+    } else if (tools.builtinExists(c.name)) {
+        // Code-mode tools are attached to the payload without living
+        // in tool_defs — a bare builtin name resolves here.
+        var d: tools.ToolDef = .{ .name = c.name, .exec = .builtin };
+        const res = tools.exec(g, s.io, &d, c.args_json.items, s.deps.cfg.workspace);
+        c.result = res;
+        c.state = .done;
+        noteFmtIn(s, "tool", "{s}({s}) → {s}", .{ c.name, c.args_json.items, res }, convOfMsg(s, am));
     } else {
         // Not a declared tool — answer like a real API would: error
         // result so the model can recover.
@@ -931,6 +1016,168 @@ fn resolveCall(s: *Session, am: *state.Msg, c: *state.ToolCall) void {
         c.state = .failed;
         noteFmtIn(s, "tool", "{s}: unknown tool", .{c.name}, convOfMsg(s, am));
     }
+}
+
+// ── code-mode background processes ───────────────────────────────
+
+/// Dispatch a proc_* tool call — all handlers are synchronous and
+/// return gpa-owned result text.
+fn procExec(s: *Session, name: []const u8, args_json: []const u8) []const u8 {
+    const g = s.gpa;
+    var parsed = std.json.parseFromSlice(std.json.Value, g, args_json, .{}) catch
+        return state.dupe(g, "error: bad args json");
+    defer parsed.deinit();
+    const obj: ?std.json.ObjectMap = switch (parsed.value) {
+        .object => |o| o,
+        else => null,
+    };
+    if (std.mem.eql(u8, name, "proc_start")) return procStart(s, obj);
+    if (std.mem.eql(u8, name, "proc_output")) return procOutput(s, obj);
+    if (std.mem.eql(u8, name, "proc_list")) return procList(s);
+    if (std.mem.eql(u8, name, "proc_kill")) return procKill(s, obj);
+    return state.dupe(g, "error: unknown proc tool");
+}
+
+fn procFind(s: *Session, id: u32) ?*Proc {
+    for (s.deps.procs.items) |*p| {
+        if (p.id == id) return p;
+    }
+    return null;
+}
+
+/// Drain whatever pipe data is available right now (non-blocking),
+/// then reap the child once BOTH pipes hit EOF.
+fn procDrain(s: *Session, p: *Proc) void {
+    if (p.done) return;
+    const so = p.child.stdout orelse return;
+    const se = p.child.stderr orelse return;
+    const fds = [_]std.posix.fd_t{ so.handle, se.handle };
+    var chunk: [8192]u8 = undefined;
+    while (true) {
+        var pfds = [_]std.posix.pollfd{
+            .{ .fd = fds[0], .events = if (p.eof[0]) 0 else std.posix.POLL.IN, .revents = 0 },
+            .{ .fd = fds[1], .events = if (p.eof[1]) 0 else std.posix.POLL.IN, .revents = 0 },
+        };
+        _ = std.posix.poll(&pfds, 0) catch return;
+        var any = false;
+        for (pfds, 0..) |pfd, i| {
+            if (pfd.revents == 0) continue;
+            any = true;
+            const n = std.posix.read(fds[i], &chunk) catch {
+                p.eof[i] = true;
+                continue;
+            };
+            if (n == 0) {
+                p.eof[i] = true;
+                continue;
+            }
+            if (p.out.items.len < 256 * 1024) {
+                const room = 256 * 1024 - p.out.items.len;
+                p.out.appendSlice(s.gpa, chunk[0..@min(n, room)]) catch {};
+            }
+        }
+        if (!any) break;
+    }
+    if (p.eof[0] and p.eof[1]) {
+        if (p.child.wait(s.io)) |t| {
+            p.code = switch (t) {
+                .exited => |c| @intCast(c),
+                else => -1,
+            };
+        } else |_| {
+            p.code = -1;
+        }
+        p.done = true;
+    }
+}
+
+fn procStart(s: *Session, obj: ?std.json.ObjectMap) []const u8 {
+    const g = s.gpa;
+    const cmd = tools.argStr(obj, "command") orelse return state.dupe(g, "error: missing 'command'");
+    if (cmd.len == 0 or cmd.len > 4000) return state.dupe(g, "error: command empty or too long");
+    const argv = [_][]const u8{ "sh", "-c", cmd };
+    var child = std.process.spawn(s.io, .{
+        .argv = &argv,
+        .stdin = .ignore,
+        .stdout = .pipe,
+        .stderr = .pipe,
+        .cwd = if (s.deps.cfg.workspace.len != 0) .{ .path = s.deps.cfg.workspace } else .inherit,
+    }) catch return state.dupe(g, "error: spawn failed");
+    const id = s.deps.proc_seq;
+    s.deps.proc_seq +%= 1;
+    const heap_child = g.create(std.process.Child) catch {
+        child.kill(s.io);
+        return state.dupe(g, "error: oom");
+    };
+    heap_child.* = child;
+    const cmd_dup = state.dupe(g, cmd);
+    s.deps.procs.append(g, .{
+        .id = id,
+        .cmd = cmd_dup,
+        .child = heap_child,
+    }) catch {
+        state.freeStr(g, cmd_dup);
+        heap_child.kill(s.io);
+        g.destroy(heap_child);
+        return state.dupe(g, "error: oom");
+    };
+    return std.fmt.allocPrint(g, "proc {d} started: {s}", .{ id, cmd }) catch @panic("OOM");
+}
+
+fn procOutput(s: *Session, obj: ?std.json.ObjectMap) []const u8 {
+    const g = s.gpa;
+    const id = tools.argF64(obj, "id") orelse return state.dupe(g, "error: missing 'id'");
+    const p = procFind(s, @intFromFloat(id)) orelse
+        return state.dupe(g, "error: no such proc");
+    procDrain(s, p);
+    const fresh = p.out.items[p.pos..];
+    p.pos = p.out.items.len;
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(g);
+    // Tail-cap very large bursts so the tool result stays sane.
+    const slice = if (fresh.len > 32 * 1024) fresh[fresh.len - 32 * 1024 ..] else fresh;
+    if (slice.len != fresh.len) out.appendSlice(g, "[earlier output truncated]\n") catch @panic("OOM");
+    out.appendSlice(g, slice) catch @panic("OOM");
+    const status = if (p.done)
+        std.fmt.allocPrint(g, "exited {d}", .{p.code}) catch @panic("OOM")
+    else
+        state.dupe(g, "running");
+    defer g.free(status);
+    out.print(g, "\n[proc {d}: {s}]", .{ p.id, status }) catch @panic("OOM");
+    return out.toOwnedSlice(g) catch @panic("OOM");
+}
+
+fn procList(s: *Session) []const u8 {
+    const g = s.gpa;
+    if (s.deps.procs.items.len == 0) return state.dupe(g, "no background processes");
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(g);
+    for (s.deps.procs.items) |*p| {
+        procDrain(s, p);
+        const st = if (p.done)
+            std.fmt.allocPrint(g, "exited {d}", .{p.code}) catch @panic("OOM")
+        else
+            state.dupe(g, "running");
+        defer g.free(st);
+        const cmd = p.cmd[0..@min(p.cmd.len, 80)];
+        out.print(g, "proc {d}: {s} — {s}\n", .{ p.id, st, cmd }) catch @panic("OOM");
+    }
+    return out.toOwnedSlice(g) catch @panic("OOM");
+}
+
+fn procKill(s: *Session, obj: ?std.json.ObjectMap) []const u8 {
+    const g = s.gpa;
+    const id = tools.argF64(obj, "id") orelse return state.dupe(g, "error: missing 'id'");
+    const p = procFind(s, @intFromFloat(id)) orelse
+        return state.dupe(g, "error: no such proc");
+    if (p.done) {
+        return std.fmt.allocPrint(g, "proc {d} already exited {d}", .{ p.id, p.code }) catch @panic("OOM");
+    }
+    p.child.kill(s.io);
+    p.done = true;
+    p.code = -1;
+    p.eof = .{ true, true };
+    return std.fmt.allocPrint(g, "proc {d} killed", .{p.id}) catch @panic("OOM");
 }
 
 /// MCP tool call: async JSON-RPC tools/call on the MCP mailbox.
