@@ -190,6 +190,18 @@ pub fn build(b: *std.Build) void {
 
     b.installArtifact(blog);
 
+    // The zllm app: OpenAI-compatible LLM playground — streaming SSE
+    // chat, tool calls, inspector. No sqlite, no plugins, no libc.
+    const llm_mod = b.createModule(.{
+        .root_source_file = b.path("src/apps/llm/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &app_imports,
+    });
+    const llm = b.addExecutable(.{ .name = "zllm", .root_module = llm_mod });
+
+    b.installArtifact(llm);
+
     const run_step = b.step("run", "Run the todo server");
     const run_cmd = b.addRunArtifact(exe);
     run_step.dependOn(&run_cmd.step);
@@ -221,6 +233,12 @@ pub fn build(b: *std.Build) void {
     run_blog_cmd.step.dependOn(b.getInstallStep());
     run_blog_cmd.addPassthruArgs();
 
+    const run_llm_step = b.step("run-llm", "Run the zllm playground (args: [port] [bind-ip]; env ZLLM_API_KEY)");
+    const run_llm_cmd = b.addRunArtifact(llm);
+    run_llm_step.dependOn(&run_llm_cmd.step);
+    run_llm_cmd.step.dependOn(b.getInstallStep());
+    run_llm_cmd.addPassthruArgs();
+
     // App test binaries: each app's main.zig test block pulls in its
     // whole module graph; sqlite is linked into the zforest/zboard
     // test binaries via the shared zdb module.
@@ -242,6 +260,9 @@ pub fn build(b: *std.Build) void {
     const blog_tests = b.addTest(.{ .root_module = blog_mod });
     const run_blog_tests = b.addRunArtifact(blog_tests);
 
+    const llm_tests = b.addTest(.{ .root_module = llm_mod });
+    const run_llm_tests = b.addRunArtifact(llm_tests);
+
     // Plugin modules are separate Zig modules, so their `test` blocks
     // do not run inside the app test binaries — each gets its own test
     // artifact rooted at the plugin file.
@@ -261,6 +282,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_zcar_tests.step);
     test_step.dependOn(&run_demo_tests.step);
     test_step.dependOn(&run_blog_tests.step);
+    test_step.dependOn(&run_llm_tests.step);
     test_step.dependOn(&run_html_tests.step);
     test_step.dependOn(&run_markdown_tests.step);
     test_step.dependOn(&run_seo_tests.step);

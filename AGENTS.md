@@ -19,7 +19,11 @@
 - Apps: `todo` (exe `zforest`, sqlite via `zdb`), `board` (exe `zboard`,
   sqlite via `zdb`), `mon` (exe `zmon`, live bindings, libc), `car`
   (exe `zcar`), `zmeta_demo` (exe `zmeta-demo`), `blog` (exe `zblog`,
-  read-only markdown CMS + SEO, no sqlite).
+  read-only markdown CMS + SEO, no sqlite), `llm` (exe `zllm`,
+  OpenAI-compatible LLM playground: streaming chat, tool calls with
+  approve/reject/auto modes, /models fetch, request/response inspector,
+  token/context meter; API key via `ZLLM_API_KEY` env or per-session
+  config, never rendered).
 - `plugins/*.zig` — compile-time Zig plugin modules (`html`,
   `markdown`, `seo`, `rss`) imported by apps as named modules
   (`zplug_*`); declared via `createModule` in `build.zig` with
@@ -45,11 +49,12 @@
 ## Build, Test, and Development Commands
 
 - `zig build`: compile and install the executables (`zforest`, `zboard`,
-  `zmon`, `zcar`, `zmeta-demo`, `zblog`) — requires `../zforest`
+  `zmon`, `zcar`, `zmeta-demo`, `zblog`, `zllm`) — requires `../zforest`
   checked out.
 - `zig build run` / `run-board` / `run-mon` / `run-car` / `run-demo` /
-  `run-blog`: run an app (args pass through to the exe; `zblog` takes
-  `[port] [bind-ip] [content-dir]`).
+  `run-blog` / `run-llm`: run an app (args pass through to the exe;
+  `zblog` takes `[port] [bind-ip] [content-dir]`, `zllm` takes
+  `[port] [bind-ip]`).
 - `zig build test`: run the six app test targets plus one per plugin
   module under `plugins/`.
 - `zig build gen`: regenerate `src/apps/*/gen/*.zig` (idempotent).
