@@ -1,10 +1,19 @@
-//! mcp — MCP (Model Context Protocol) client for zllm, Streamable
-//! HTTP transport only (JSON-RPC 2.0 over POST; responses may be
-//! `application/json` or `text/event-stream`).
+//! mcp — MCP (Model Context Protocol) client for zllm.
 //!
-//! Config lives in the `cfg.mcp_servers` field — a JSON array:
+//! Two transports:
+//!   - Streamable HTTP: JSON-RPC 2.0 over POST; responses may be
+//!     `application/json` or `text/event-stream`.
+//!   - stdio: child process spawned per job, newline-delimited
+//!     JSON-RPC on stdin/stdout (the classic local-server transport —
+//!     e.g. `npx chrome-devtools-mcp`).
+//!
+//! Config lives in the `cfg.mcp_servers` field — a JSON array; each
+//! entry is either HTTP or stdio:
 //!   [{"name":"fs","url":"http://127.0.0.1:8080/mcp",
-//!     "headers":{"Authorization":"Bearer …"}}]
+//!     "headers":{"Authorization":"Bearer …"}},
+//!    {"name":"chrome","command":"npx",
+//!     "args":["-y","chrome-devtools-mcp@latest"],
+//!     "env":{"HEADLESS":"true"}}]
 //!
 //! Two worker jobs (state.JobKind):
 //!   - `mcp_check` — body = the servers config JSON. Per server:
@@ -19,6 +28,7 @@
 //! (outbound) and `.raw` (inbound) — applyEv relabels them "mcp"
 //! for these job kinds.
 const std = @import("std");
+const builtin = @import("builtin");
 const Io = std.Io;
 const state = @import("state.zig");
 
@@ -34,20 +44,17 @@ pub const Header = struct {
 
 pub const Server = struct {
     name: []const u8,
-    url: []const u8,
+    /// false → HTTP (url+headers), true → stdio (command+args+env).
+    stdio: bool = false,
+    url: []const u8 = "",
     headers: []Header = &.{},
+    command: []const u8 = "",
+    args: [][]const u8 = &.{},
+    env: []Header = &.{},
 };
 
 pub fn freeServers(gpa: std.mem.Allocator, servers: []Server) void {
-    for (servers) |s| {
-        gpa.free(s.name);
-        gpa.free(s.url);
-        for (s.headers) |h| {
-            gpa.free(h.name);
-            gpa.free(h.value);
-        }
-        gpa.free(s.headers);
-    }
+    for (servers) |*s| freeServer(gpa, s);
     gpa.free(servers);
 }
 
@@ -105,15 +112,7 @@ pub fn parseConfig(gpa: std.mem.Allocator, json: []const u8) ![]Server {
     const servers = try gpa.alloc(Server, arr.items.len);
     var n: usize = 0;
     errdefer {
-        for (servers[0..n]) |s| {
-            gpa.free(s.name);
-            gpa.free(s.url);
-            for (s.headers) |h| {
-                gpa.free(h.name);
-                gpa.free(h.value);
-            }
-            gpa.free(s.headers);
-        }
+        for (servers[0..n]) |*s| freeServer(gpa, s);
         gpa.free(servers);
     }
     for (arr.items) |item| {
@@ -127,24 +126,83 @@ pub fn parseConfig(gpa: std.mem.Allocator, json: []const u8) ![]Server {
             else => return error.BadServer,
         };
         if (!validName(name)) return error.BadName;
-        const url_v = obj.get("url") orelse return error.BadServer;
-        const url = switch (url_v) {
-            .string => |s| s,
-            else => return error.BadServer,
-        };
-        if (url.len == 0 or url.len > 512) return error.BadServer;
-        const u = std.Uri.parse(url) catch return error.BadUrl;
-        if (!std.mem.eql(u8, u.scheme, "http") and !std.mem.eql(u8, u.scheme, "https")) return error.BadUrl;
-        var headers: []Header = &.{};
-        if (obj.get("headers")) |hv| headers = try parseHeaders(gpa, hv);
-        servers[n] = .{
-            .name = state.dupe(gpa, name),
-            .url = state.dupe(gpa, url),
-            .headers = headers,
-        };
+        const has_cmd = obj.get("command") != null;
+        const has_url = obj.get("url") != null;
+        if (has_cmd == has_url) return error.BadServer; // need exactly one
+        var srv = Server{ .name = state.dupe(gpa, name) };
+        errdefer freeServer(gpa, &srv);
+        if (has_cmd) {
+            srv.stdio = true;
+            const cmd_v = obj.get("command").?;
+            const cmd = switch (cmd_v) {
+                .string => |s| s,
+                else => return error.BadServer,
+            };
+            if (cmd.len == 0 or cmd.len > 512) return error.BadServer;
+            srv.command = state.dupe(gpa, cmd);
+            if (obj.get("args")) |av| {
+                srv.args = try parseArgs(gpa, av);
+            }
+            if (obj.get("env")) |ev| srv.env = try parseHeaders(gpa, ev);
+        } else {
+            const url_v = obj.get("url").?;
+            const url = switch (url_v) {
+                .string => |s| s,
+                else => return error.BadServer,
+            };
+            if (url.len == 0 or url.len > 512) return error.BadServer;
+            const u = std.Uri.parse(url) catch return error.BadUrl;
+            if (!std.mem.eql(u8, u.scheme, "http") and !std.mem.eql(u8, u.scheme, "https")) return error.BadUrl;
+            srv.url = state.dupe(gpa, url);
+            if (obj.get("headers")) |hv| srv.headers = try parseHeaders(gpa, hv);
+        }
+        servers[n] = srv;
         n += 1;
     }
     return servers[0..n];
+}
+
+fn freeServer(gpa: std.mem.Allocator, s: *Server) void {
+    gpa.free(s.name);
+    if (s.url.len != 0) gpa.free(s.url);
+    if (s.command.len != 0) gpa.free(s.command);
+    for (s.args) |a| gpa.free(a);
+    if (s.args.len != 0) gpa.free(s.args);
+    for (s.headers) |h| {
+        gpa.free(h.name);
+        gpa.free(h.value);
+    }
+    if (s.headers.len != 0) gpa.free(s.headers);
+    for (s.env) |h| {
+        gpa.free(h.name);
+        gpa.free(h.value);
+    }
+    if (s.env.len != 0) gpa.free(s.env);
+}
+
+/// Parse a stdio `args` array — bounded list of short strings.
+fn parseArgs(gpa: std.mem.Allocator, v: std.json.Value) ![][]const u8 {
+    const arr = switch (v) {
+        .array => |a| a,
+        else => return error.BadServer,
+    };
+    if (arr.items.len > 16) return error.TooMany;
+    const out = try gpa.alloc([]const u8, arr.items.len);
+    var n: usize = 0;
+    errdefer {
+        for (out[0..n]) |a| gpa.free(a);
+        gpa.free(out);
+    }
+    for (arr.items) |item| {
+        const s = switch (item) {
+            .string => |s| s,
+            else => return error.BadServer,
+        };
+        if (s.len > 1024) return error.BadServer;
+        out[n] = state.dupe(gpa, s);
+        n += 1;
+    }
+    return out;
 }
 
 // ── wire names ───────────────────────────────────────────────────
@@ -494,6 +552,265 @@ fn handshake(c: *Conn, mb: *state.Mailbox) !void {
     _ = try postRaw(c, mb, note);
 }
 
+// ── stdio transport ──────────────────────────────────────────────
+//
+// MCP stdio = newline-delimited JSON-RPC on the child's stdin/stdout.
+// A fresh process is spawned per job (check or call): spawn →
+// initialize → notifications/initialized → the actual request → kill.
+// Simple lifecycle, no cross-job state, inspector shows each spawn.
+
+const StdioProc = struct {
+    gpa: std.mem.Allocator,
+    io: Io,
+    child: std.process.Child,
+    /// Human label for inspector entries ("npx -y pkg …").
+    label: []const u8,
+    alive: *std.atomic.Value(bool),
+    cancel: *std.atomic.Value(bool),
+    proto_ver: []u8 = &.{},
+    next_id: u32 = 1,
+    /// Received-but-unconsumed bytes; may hold several lines.
+    pending: std.ArrayListUnmanaged(u8) = .empty,
+
+    const MAX_PENDING = 8 * 1024 * 1024;
+
+    fn cancelled(self: *const StdioProc) bool {
+        return !self.alive.load(.seq_cst) or self.cancel.load(.seq_cst);
+    }
+
+    fn deinit(self: *StdioProc) void {
+        // kill() terminates, reaps and closes the pipes (idempotent).
+        self.child.kill(self.io);
+        self.gpa.free(self.label);
+        if (self.proto_ver.len != 0) self.gpa.free(self.proto_ver);
+        self.pending.deinit(self.gpa);
+    }
+
+    /// Copy the parent environment into `map` (posix only) so a
+    /// replaced child env still has PATH & friends.
+    fn inheritEnviron(map: *std.process.Environ.Map) void {
+        switch (builtin.os.tag) {
+            .windows, .wasi, .emscripten, .freestanding, .other => {},
+            else => {
+                var i: usize = 0;
+                while (std.c.environ[i]) |entry| : (i += 1) {
+                    const s = std.mem.span(entry);
+                    const eq = std.mem.indexOfScalar(u8, s, '=') orelse continue;
+                    if (s[0..eq].len == 0) continue;
+                    map.put(s[0..eq], s[eq + 1 ..]) catch {};
+                }
+            },
+        }
+    }
+
+    /// env_json = "{}" or a JSON object of string vars. Returns null
+    /// when there is nothing to override (child inherits as-is).
+    fn buildEnvMap(gpa: std.mem.Allocator, env_json: []const u8) !?*std.process.Environ.Map {
+        const t = std.mem.trim(u8, env_json, " \t\r\n");
+        if (t.len <= 2) return null;
+        var p = std.json.parseFromSlice(std.json.Value, gpa, t, .{}) catch return error.BadJson;
+        defer p.deinit();
+        if (p.value != .object or p.value.object.count() == 0) return null;
+        const map = try gpa.create(std.process.Environ.Map);
+        map.* = .init(gpa);
+        errdefer {
+            map.deinit();
+            gpa.destroy(map);
+        }
+        inheritEnviron(map);
+        var it = p.value.object.iterator();
+        while (it.next()) |e| {
+            const v = switch (e.value_ptr.*) {
+                .string => |s| s,
+                else => continue,
+            };
+            if (!std.process.Environ.Map.validateKeyForPut(e.key_ptr.*)) continue;
+            try map.put(e.key_ptr.*, v);
+        }
+        return map;
+    }
+
+    fn spawn(gpa: std.mem.Allocator, io: Io, argv: []const []const u8, env_json: []const u8, alive: *std.atomic.Value(bool), cancel: *std.atomic.Value(bool)) !StdioProc {
+        if (argv.len == 0) return error.BadArgv;
+        const em = try buildEnvMap(gpa, env_json);
+        defer if (em) |m| {
+            m.deinit();
+            gpa.destroy(m);
+        };
+        const child = std.process.spawn(io, .{
+            .argv = argv,
+            .stdin = .pipe,
+            .stdout = .pipe,
+            .stderr = .inherit, // server logs land in zllm's stderr
+            .environ_map = if (em) |m| m else null,
+        }) catch return error.Spawn;
+        // Inspector label: "cmd arg1 arg2 …" capped at 120 chars.
+        var lab: std.ArrayListUnmanaged(u8) = .empty;
+        for (argv, 0..) |a, i| {
+            if (i != 0) lab.append(gpa, ' ') catch @panic("OOM");
+            if (lab.items.len + a.len > 120) {
+                lab.appendSlice(gpa, "…") catch @panic("OOM");
+                break;
+            }
+            lab.appendSlice(gpa, a) catch @panic("OOM");
+        }
+        return .{
+            .gpa = gpa,
+            .io = io,
+            .child = child,
+            .label = lab.toOwnedSlice(gpa) catch @panic("OOM"),
+            .alive = alive,
+            .cancel = cancel,
+        };
+    }
+
+    fn writeFrame(self: *StdioProc, bytes: []const u8) !void {
+        try self.writeRaw(bytes);
+        try self.writeRaw("\n");
+    }
+
+    fn writeRaw(self: *StdioProc, bytes: []const u8) !void {
+        const f = self.child.stdin orelse return error.NoResponse;
+        if (self.cancelled()) return error.Cancelled;
+        f.writeStreamingAll(self.io, bytes) catch return error.NoResponse;
+    }
+
+    /// Read one '\n'-terminated line; returns a gpa-owned copy (caller
+    /// frees), strips a trailing '\r'. null = clean EOF, error =
+    /// transport failure/cancel.
+    fn readLine(self: *StdioProc) !?[]u8 {
+        const gpa = self.gpa;
+        if (std.mem.indexOfScalar(u8, self.pending.items, '\n')) |nl| {
+            return self.takeLine(nl);
+        }
+        var chunk: [16384]u8 = undefined;
+        while (true) {
+            if (self.cancelled()) return error.Cancelled;
+            if (self.pending.items.len > MAX_PENDING) return error.StreamTooLong;
+            var fds = [_]std.posix.pollfd{.{
+                .fd = self.child.stdout.?.handle,
+                .events = std.posix.POLL.IN,
+                .revents = 0,
+            }};
+            _ = std.posix.poll(&fds, 200) catch return error.NoResponse;
+            const re = fds[0].revents;
+            if (re == 0) continue; // poll timeout — recheck cancel
+            if (re & (std.posix.POLL.ERR | std.posix.POLL.NVAL) != 0) return error.NoResponse;
+            const n = std.posix.read(self.child.stdout.?.handle, &chunk) catch return error.NoResponse;
+            if (n == 0) {
+                if (self.pending.items.len == 0) return null;
+                const line = gpa.dupe(u8, self.pending.items) catch @panic("OOM");
+                self.pending.clearRetainingCapacity();
+                return line;
+            }
+            self.pending.appendSlice(gpa, chunk[0..n]) catch @panic("OOM");
+            if (std.mem.indexOfScalar(u8, self.pending.items, '\n')) |nl| {
+                return self.takeLine(nl);
+            }
+        }
+    }
+
+    fn takeLine(self: *StdioProc, nl: usize) []u8 {
+        const gpa = self.gpa;
+        var end = nl;
+        if (end != 0 and self.pending.items[end - 1] == '\r') end -= 1;
+        const line = gpa.dupe(u8, self.pending.items[0..end]) catch @panic("OOM");
+        const rest = self.pending.items[nl + 1 ..];
+        std.mem.copyForwards(u8, self.pending.items[0..rest.len], rest);
+        self.pending.shrinkRetainingCapacity(rest.len);
+        return line;
+    }
+
+    /// Write a JSON-RPC request envelope and read lines until the
+    /// response with our id arrives. Notifications and server→client
+    /// requests are logged and skipped (the latter get a
+    /// method-not-found reply so the server isn't left hanging).
+    fn request(self: *StdioProc, mb: *state.Mailbox, method: []const u8, params: []const u8) !std.json.Parsed(std.json.Value) {
+        const gpa = self.gpa;
+        const id = self.next_id;
+        self.next_id += 1;
+        const body = envelope(gpa, id, method, params);
+        defer gpa.free(body);
+        const pb = state.prettyJson(gpa, body);
+        defer gpa.free(pb);
+        const desc = std.fmt.allocPrint(gpa, "MCP stdio {s}\n\n{s}", .{ self.label, pb }) catch return error.NoResponse;
+        mb.push(.{ .req = desc });
+        try self.writeFrame(body);
+        while (true) {
+            const line = (try self.readLine()) orelse return error.NoResponse;
+            defer gpa.free(line);
+            const t = std.mem.trim(u8, line, " \t\r\n");
+            if (t.len == 0) continue;
+            var p = std.json.parseFromSlice(std.json.Value, gpa, t, .{}) catch {
+                mb.push(.{ .raw = state.dupe(gpa, t) });
+                continue;
+            };
+            const obj = switch (p.value) {
+                .object => |o| o,
+                else => {
+                    p.deinit();
+                    mb.push(.{ .raw = state.dupe(gpa, t) });
+                    continue;
+                },
+            };
+            const id_v = obj.get("id");
+            if (obj.get("method") != null and id_v != null) {
+                // Server→client request: decline politely, keep waiting.
+                self.replyError(id_v.?) catch {};
+                mb.push(.{ .raw = state.dupe(gpa, t) });
+                p.deinit();
+                continue;
+            }
+            const match = if (id_v) |iv| switch (iv) {
+                .integer => iv.integer == @as(i64, id),
+                else => false,
+            } else false;
+            if (match) {
+                mb.push(.{ .raw = state.dupe(gpa, t) });
+                return p;
+            }
+            mb.push(.{ .raw = state.dupe(gpa, t) });
+            p.deinit();
+        }
+    }
+
+    /// Error reply for an inbound server→client request.
+    fn replyError(self: *StdioProc, id_v: std.json.Value) !void {
+        var aw: std.Io.Writer.Allocating = .init(self.gpa);
+        const w = &aw.writer;
+        w.writeAll("{\"jsonrpc\":\"2.0\",\"id\":") catch return error.NoResponse;
+        switch (id_v) {
+            .integer => w.print("{d}", .{id_v.integer}) catch return error.NoResponse,
+            .string => state.jsonStrPub(w, id_v.string) catch return error.NoResponse,
+            else => return,
+        }
+        w.writeAll(",\"error\":{\"code\":-32601,\"message\":\"zllm: unsupported\"}}") catch return error.NoResponse;
+        const msg = aw.toOwnedSlice() catch return error.NoResponse;
+        defer self.gpa.free(msg);
+        try self.writeFrame(msg);
+    }
+
+    /// initialize → notifications/initialized (write-only).
+    fn handshake(self: *StdioProc, mb: *state.Mailbox) !void {
+        const env = try self.request(mb, "initialize", INIT_PARAMS);
+        defer env.deinit();
+        const result = switch (env.value) {
+            .object => |o| o.get("result") orelse return error.Rpc,
+            else => return error.Rpc,
+        };
+        if (result == .object) {
+            if (result.object.get("protocolVersion")) |pv| {
+                if (pv == .string and pv.string.len != 0 and pv.string.len <= 64) {
+                    self.proto_ver = self.gpa.dupe(u8, pv.string) catch @panic("OOM");
+                }
+            }
+        }
+        const note = notification(self.gpa, "notifications/initialized");
+        defer self.gpa.free(note);
+        try self.writeFrame(note);
+    }
+};
+
 // ── workers ──────────────────────────────────────────────────────
 
 fn pushCheck(mb: *state.Mailbox, server: []const u8, ok: bool, detail: []const u8, tools_json: []const u8) void {
@@ -505,13 +822,62 @@ fn pushCheck(mb: *state.Mailbox, server: []const u8, ok: bool, detail: []const u
     } });
 }
 
-fn checkOne(mb: *state.Mailbox, srv: Server) void {
+/// Shared tail of a successful tools/list exchange: unwrap the
+/// envelope, convert to OpenAI tools, push the `.mcp` event.
+/// Takes ownership of `env` (deinit'ed inside).
+fn finishCheck(mb: *state.Mailbox, server: []const u8, env: std.json.Parsed(std.json.Value), proto_ver: []const u8) void {
     const gpa = mb.gpa;
-    var conn = Conn.init(gpa, mb.io, srv.url, "", &mb.alive, &mb.cancel);
-    defer conn.deinit();
-    errdefer {
-        // Errors are reported by the caller via pushCheck.
+    defer env.deinit();
+    if (env.value == .object) {
+        if (env.value.object.get("error")) |ev| {
+            var msg_buf: [256]u8 = undefined;
+            var msg: []const u8 = "tools/list error";
+            if (ev == .object) {
+                if (ev.object.get("message")) |mv| {
+                    if (mv == .string) msg = mv.string;
+                }
+            }
+            const d = std.fmt.bufPrint(&msg_buf, "{s}", .{msg}) catch msg;
+            pushCheck(mb, server, false, d, "[]");
+            return;
+        }
     }
+    const result = switch (env.value) {
+        .object => |o| o.get("result") orelse {
+            pushCheck(mb, server, false, "no result in tools/list", "[]");
+            return;
+        },
+        else => {
+            pushCheck(mb, server, false, "bad tools/list response", "[]");
+            return;
+        },
+    };
+    // `result` is {"tools": [...]} — toolsToOpenAi wants the array.
+    const tools_v = if (result == .object) result.object.get("tools") orelse result else result;
+    const tools_json = toolsToOpenAi(gpa, tools_v, server);
+    // Accurate tool count from the tools array length.
+    var n: usize = 0;
+    if (result == .object) {
+        if (result.object.get("tools")) |tv| {
+            if (tv == .array) n = tv.array.items.len;
+        }
+    }
+    var dbuf: [128]u8 = undefined;
+    const detail = std.fmt.bufPrint(&dbuf, "ok — {d} tool(s), protocol {s}", .{ n, if (proto_ver.len != 0) proto_ver else "?" }) catch "ok";
+    pushCheck(mb, server, true, detail, tools_json);
+    gpa.free(tools_json);
+}
+
+fn checkOne(mb: *state.Mailbox, srv: Server) void {
+    if (srv.stdio) {
+        checkOneStdio(mb, srv);
+        return;
+    }
+    const gpa = mb.gpa;
+    const hdrs_json = headersJsonFor(gpa, srv.headers);
+    defer gpa.free(hdrs_json);
+    var conn = Conn.init(gpa, mb.io, srv.url, hdrs_json, &mb.alive, &mb.cancel);
+    defer conn.deinit();
     handshake(&conn, mb) catch |e| {
         const msg = switch (e) {
             error.Http => "HTTP error",
@@ -526,7 +892,7 @@ fn checkOne(mb: *state.Mailbox, srv: Server) void {
     };
     const body = envelope(gpa, 2, "tools/list", "{}");
     defer gpa.free(body);
-    var env = rpc(&conn, mb, body) catch |e| {
+    const env = rpc(&conn, mb, body) catch |e| {
         const msg = switch (e) {
             error.Http => "HTTP error",
             error.BadJson => "tools/list failed",
@@ -536,45 +902,64 @@ fn checkOne(mb: *state.Mailbox, srv: Server) void {
         pushCheck(mb, srv.name, false, msg, "[]");
         return;
     };
-    defer env.deinit();
-    if (env.value == .object) {
-        if (env.value.object.get("error")) |ev| {
-            var msg_buf: [256]u8 = undefined;
-            var msg: []const u8 = "tools/list error";
-            if (ev == .object) {
-                if (ev.object.get("message")) |mv| {
-                    if (mv == .string) msg = mv.string;
-                }
-            }
-            const d = std.fmt.bufPrint(&msg_buf, "{s}", .{msg}) catch msg;
-            pushCheck(mb, srv.name, false, d, "[]");
-            return;
-        }
-    }
-    const result = switch (env.value) {
-        .object => |o| o.get("result") orelse {
-            pushCheck(mb, srv.name, false, "no result in tools/list", "[]");
-            return;
-        },
-        else => {
-            pushCheck(mb, srv.name, false, "bad tools/list response", "[]");
-            return;
-        },
+    finishCheck(mb, srv.name, env, conn.proto_ver);
+}
+
+/// argv for a stdio server: [command, args…] — slices borrow `srv`
+/// (alive for the whole checkOne call; spawn consumes synchronously).
+fn serverArgv(gpa: std.mem.Allocator, srv: Server) ![][]const u8 {
+    const argv = try gpa.alloc([]const u8, srv.args.len + 1);
+    argv[0] = srv.command;
+    for (srv.args, 0..) |a, i| argv[i + 1] = a;
+    return argv;
+}
+
+fn stdioFail(mb: *state.Mailbox, server: []const u8, comptime fmt: []const u8, args: anytype) void {
+    var buf: [256]u8 = undefined;
+    const msg = std.fmt.bufPrint(&buf, fmt, args) catch "stdio error";
+    pushCheck(mb, server, false, msg, "[]");
+}
+
+fn checkOneStdio(mb: *state.Mailbox, srv: Server) void {
+    const gpa = mb.gpa;
+    const argv = serverArgv(gpa, srv) catch {
+        stdioFail(mb, srv.name, "bad argv", .{});
+        return;
     };
-    // `result` is {"tools": [...]} — toolsToOpenAi wants the array.
-    const tools_v = if (result == .object) result.object.get("tools") orelse result else result;
-    const tools_json = toolsToOpenAi(gpa, tools_v, srv.name);
-    // Accurate tool count from the tools array length.
-    var n: usize = 0;
-    if (result == .object) {
-        if (result.object.get("tools")) |tv| {
-            if (tv == .array) n = tv.array.items.len;
-        }
-    }
-    var dbuf: [128]u8 = undefined;
-    const detail = std.fmt.bufPrint(&dbuf, "ok — {d} tool(s), protocol {s}", .{ n, if (conn.proto_ver.len != 0) conn.proto_ver else "?" }) catch "ok";
-    pushCheck(mb, srv.name, true, detail, tools_json);
-    gpa.free(tools_json);
+    defer gpa.free(argv);
+    const env_json = headersJsonFor(gpa, srv.env);
+    defer gpa.free(env_json);
+    var sp = StdioProc.spawn(gpa, mb.io, argv, env_json, &mb.alive, &mb.cancel) catch |e| {
+        const msg = switch (e) {
+            error.Spawn => "spawn failed (command not found?)",
+            error.BadJson => "bad env JSON",
+            error.OutOfMemory => "out of memory",
+            else => "spawn failed",
+        };
+        pushCheck(mb, srv.name, false, msg, "[]");
+        return;
+    };
+    defer sp.deinit();
+    sp.handshake(mb) catch |e| {
+        const msg = switch (e) {
+            error.Rpc => "initialize failed (JSON-RPC error)",
+            error.NoResponse => "empty response / process exited",
+            error.Cancelled => "cancelled",
+            error.StreamTooLong => "response line too long",
+        };
+        pushCheck(mb, srv.name, false, msg, "[]");
+        return;
+    };
+    const env = sp.request(mb, "tools/list", "{}") catch |e| {
+        const msg = switch (e) {
+            error.NoResponse => "empty response / process exited",
+            error.Cancelled => "cancelled",
+            error.StreamTooLong => "response line too long",
+        };
+        pushCheck(mb, srv.name, false, msg, "[]");
+        return;
+    };
+    finishCheck(mb, srv.name, env, sp.proto_ver);
 }
 
 /// `mcp_check` job: body = servers config JSON.
@@ -617,50 +1002,19 @@ pub fn headersJsonFor(gpa: std.mem.Allocator, headers: []const Header) []const u
     return aw.toOwnedSlice() catch @panic("OOM");
 }
 
-/// `mcp_call` job: url = endpoint, body = tools/call params object,
-/// extra = headers JSON, pos_* = call position.
-pub fn callWorker(mb: *state.Mailbox) void {
+fn failCall(mb: *state.Mailbox, text: []const u8) void {
+    mb.push(.{ .mcp_call = .{
+        .conv = mb.job.pos_conv,
+        .msg = mb.job.pos_msg,
+        .call = mb.job.pos_call,
+        .ok = false,
+        .text = state.dupe(mb.gpa, text),
+    } });
+}
+
+/// Shared tail of a tools/call exchange — takes ownership of `env`.
+fn finishCall(mb: *state.Mailbox, env: std.json.Parsed(std.json.Value)) void {
     const gpa = mb.gpa;
-    const job = &mb.job;
-    var conn = Conn.init(gpa, mb.io, job.url, job.extra, &mb.alive, &mb.cancel);
-    defer conn.deinit();
-
-    const fail = struct {
-        fn push(m: *state.Mailbox, text: []const u8) void {
-            m.push(.{ .mcp_call = .{
-                .conv = m.job.pos_conv,
-                .msg = m.job.pos_msg,
-                .call = m.job.pos_call,
-                .ok = false,
-                .text = state.dupe(m.gpa, text),
-            } });
-        }
-    }.push;
-
-    handshake(&conn, mb) catch |e| {
-        const msg = switch (e) {
-            error.Http => "mcp: HTTP error during initialize",
-            error.Rpc => "mcp: initialize failed",
-            error.BadJson => "mcp: bad JSON response",
-            error.NoResponse => "mcp: empty response",
-            error.Cancelled => "stopped by user",
-            error.OutOfMemory => "out of memory",
-        };
-        fail(mb, msg);
-        return;
-    };
-    const body = envelope(gpa, 2, "tools/call", job.body);
-    defer gpa.free(body);
-    var env = rpc(&conn, mb, body) catch |e| {
-        const msg = switch (e) {
-            error.Http => "mcp: HTTP error",
-            error.BadJson => "mcp: tools/call failed",
-            error.NoResponse => "mcp: empty response",
-            error.OutOfMemory => "out of memory",
-        };
-        fail(mb, msg);
-        return;
-    };
     defer env.deinit();
     if (env.value == .object) {
         if (env.value.object.get("error")) |ev| {
@@ -672,28 +1026,136 @@ pub fn callWorker(mb: *state.Mailbox) void {
                 }
             }
             const d = std.fmt.bufPrint(&msg_buf, "{s}", .{msg}) catch msg;
-            fail(mb, d);
+            failCall(mb, d);
             return;
         }
     }
     const result = switch (env.value) {
         .object => |o| o.get("result") orelse {
-            fail(mb, "mcp: no result in tools/call response");
+            failCall(mb, "mcp: no result in tools/call response");
             return;
         },
         else => {
-            fail(mb, "mcp: bad tools/call response");
+            failCall(mb, "mcp: bad tools/call response");
             return;
         },
     };
     const text = callResultText(gpa, result);
     mb.push(.{ .mcp_call = .{
-        .conv = job.pos_conv,
-        .msg = job.pos_msg,
-        .call = job.pos_call,
+        .conv = mb.job.pos_conv,
+        .msg = mb.job.pos_msg,
+        .call = mb.job.pos_call,
         .ok = true,
         .text = text,
     } });
+}
+
+/// `mcp_call` job: url = endpoint (http) or argv = child argv JSON
+/// (stdio), body = tools/call params object, extra = headers/env JSON,
+/// pos_* = call position.
+pub fn callWorker(mb: *state.Mailbox) void {
+    if (mb.job.argv.len != 0) {
+        callWorkerStdio(mb);
+        return;
+    }
+    const gpa = mb.gpa;
+    const job = &mb.job;
+    var conn = Conn.init(gpa, mb.io, job.url, job.extra, &mb.alive, &mb.cancel);
+    defer conn.deinit();
+
+    handshake(&conn, mb) catch |e| {
+        const msg = switch (e) {
+            error.Http => "mcp: HTTP error during initialize",
+            error.Rpc => "mcp: initialize failed",
+            error.BadJson => "mcp: bad JSON response",
+            error.NoResponse => "mcp: empty response",
+            error.Cancelled => "stopped by user",
+            error.OutOfMemory => "out of memory",
+        };
+        failCall(mb, msg);
+        return;
+    };
+    const body = envelope(gpa, 2, "tools/call", job.body);
+    defer gpa.free(body);
+    const env = rpc(&conn, mb, body) catch |e| {
+        const msg = switch (e) {
+            error.Http => "mcp: HTTP error",
+            error.BadJson => "mcp: tools/call failed",
+            error.NoResponse => "mcp: empty response",
+            error.OutOfMemory => "out of memory",
+        };
+        failCall(mb, msg);
+        return;
+    };
+    finishCall(mb, env);
+}
+
+/// stdio variant: spawn the configured command, handshake, tools/call,
+/// kill. job.argv = JSON array of argv strings; job.extra = env JSON.
+fn callWorkerStdio(mb: *state.Mailbox) void {
+    const gpa = mb.gpa;
+    const job = &mb.job;
+    const ap = std.json.parseFromSlice(std.json.Value, gpa, job.argv, .{}) catch {
+        failCall(mb, "mcp: bad argv JSON");
+        return;
+    };
+    defer ap.deinit();
+    const arr = switch (ap.value) {
+        .array => |a| a.items,
+        else => {
+            failCall(mb, "mcp: argv must be a JSON array");
+            return;
+        },
+    };
+    if (arr.len == 0) {
+        failCall(mb, "mcp: empty argv");
+        return;
+    }
+    const argv = gpa.alloc([]const u8, arr.len) catch {
+        failCall(mb, "out of memory");
+        return;
+    };
+    defer gpa.free(argv);
+    for (arr, 0..) |item, i| {
+        argv[i] = switch (item) {
+            .string => |s| s,
+            else => {
+                failCall(mb, "mcp: argv entries must be strings");
+                return;
+            },
+        };
+    }
+    var sp = StdioProc.spawn(gpa, mb.io, argv, job.extra, &mb.alive, &mb.cancel) catch |e| {
+        const msg = switch (e) {
+            error.Spawn => "mcp: spawn failed (command not found?)",
+            error.BadJson => "mcp: bad env JSON",
+            error.OutOfMemory => "out of memory",
+            else => "mcp: spawn failed",
+        };
+        failCall(mb, msg);
+        return;
+    };
+    defer sp.deinit();
+    sp.handshake(mb) catch |e| {
+        const msg = switch (e) {
+            error.Rpc => "mcp: initialize failed",
+            error.NoResponse => "mcp: empty response / process exited",
+            error.Cancelled => "stopped by user",
+            error.StreamTooLong => "mcp: response line too long",
+        };
+        failCall(mb, msg);
+        return;
+    };
+    const env = sp.request(mb, "tools/call", job.body) catch |e| {
+        const msg = switch (e) {
+            error.NoResponse => "mcp: empty response / process exited",
+            error.Cancelled => "stopped by user",
+            error.StreamTooLong => "mcp: response line too long",
+        };
+        failCall(mb, msg);
+        return;
+    };
+    finishCall(mb, env);
 }
 
 // ── tests ────────────────────────────────────────────────────────
@@ -743,4 +1205,24 @@ test "toolsToOpenAi unwraps tools array and namespaces names" {
     const empty = toolsToOpenAi(gpa, obj.value, "mock");
     defer gpa.free(empty);
     try std.testing.expectEqualStrings("[]", empty);
+}
+
+test "parseConfig accepts stdio servers" {
+    const gpa = std.testing.allocator;
+    const servers = try parseConfig(gpa, "[{\"name\":\"chrome\",\"command\":\"npx\",\"args\":[\"-y\",\"chrome-devtools-mcp@latest\"],\"env\":{\"HEADLESS\":\"true\"}}]");
+    defer freeServers(gpa, servers);
+    try std.testing.expectEqual(@as(usize, 1), servers.len);
+    try std.testing.expect(servers[0].stdio);
+    try std.testing.expectEqualStrings("npx", servers[0].command);
+    try std.testing.expectEqual(@as(usize, 2), servers[0].args.len);
+    try std.testing.expectEqualStrings("chrome-devtools-mcp@latest", servers[0].args[1]);
+    try std.testing.expectEqual(@as(usize, 1), servers[0].env.len);
+    try std.testing.expectEqualStrings("HEADLESS", servers[0].env[0].name);
+    // Both transports at once; command+url together is rejected.
+    const both = try parseConfig(gpa, "[{\"name\":\"a\",\"url\":\"http://x\"},{\"name\":\"b\",\"command\":\"cat\"}]");
+    defer freeServers(gpa, both);
+    try std.testing.expect(!both[0].stdio and both[1].stdio);
+    try std.testing.expectError(error.BadServer, parseConfig(gpa, "[{\"name\":\"a\",\"command\":\"cat\",\"url\":\"http://x\"}]"));
+    try std.testing.expectError(error.BadServer, parseConfig(gpa, "[{\"name\":\"a\",\"args\":[\"x\"]}]"));
+    try std.testing.expectError(error.BadServer, parseConfig(gpa, "[{\"name\":\"a\",\"command\":\"cat\",\"args\":\"nope\"}]"));
 }

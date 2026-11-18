@@ -205,7 +205,7 @@ fn sideBar(a: std.mem.Allocator, s: *Session) forest.Node {
         }).node(),
         h.section(a).class("card").children(.{
             h.h2(a).child("MCP servers").node(),
-            h.p(a).class("hint").child("JSON array of {name,url,headers?} — Streamable HTTP transport. “check” runs initialize + tools/list; discovered tools join the request as mcp__<server>__<tool>.").node(),
+            h.p(a).class("hint").child("JSON array — HTTP: {name,url,headers?}; stdio: {name,command,args?,env?} (e.g. npx chrome-devtools-mcp). “check” runs initialize + tools/list; tools join requests as mcp__<server>__<tool>.").node(),
             h.textarea(a)
                 .id("cfg-mcp")
                 .class("mono")

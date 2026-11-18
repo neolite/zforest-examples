@@ -1010,12 +1010,33 @@ fn resolveCallMcp(s: *Session, am: *state.Msg, c: *state.ToolCall, server_name: 
     }
     w.writeByte('}') catch @panic("OOM");
     const params = aw.toOwnedSlice() catch @panic("OOM");
-    const hdrs = mcp.headersJsonFor(g, sv.headers);
+    // stdio servers carry argv JSON + env object; http carries url +
+    // headers JSON (both ride the same Job.extra slot).
+    var argv_json: []const u8 = "";
+    var hdrs: []const u8 = undefined;
+    var url: []const u8 = "";
+    if (sv.stdio) {
+        var aw2: std.Io.Writer.Allocating = .init(g);
+        const w2 = &aw2.writer;
+        w2.writeByte('[') catch @panic("OOM");
+        state.jsonStrPub(w2, sv.command) catch @panic("OOM");
+        for (sv.args) |a| {
+            w2.writeByte(',') catch @panic("OOM");
+            state.jsonStrPub(w2, a) catch @panic("OOM");
+        }
+        w2.writeByte(']') catch @panic("OOM");
+        argv_json = aw2.toOwnedSlice() catch @panic("OOM");
+        hdrs = mcp.headersJsonFor(g, sv.env);
+    } else {
+        url = state.dupe(g, sv.url);
+        hdrs = mcp.headersJsonFor(g, sv.headers);
+    }
     const mb = state.Mailbox.create(g, s.io, .{
         .kind = .mcp_call,
-        .url = state.dupe(g, sv.url),
+        .url = url,
         .body = params,
         .extra = hdrs,
+        .argv = argv_json,
         .pos_conv = @intCast(ci),
         .pos_msg = @intCast(mi),
         .pos_call = @intCast(ki),

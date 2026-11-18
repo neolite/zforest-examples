@@ -152,8 +152,12 @@ pub const Job = struct {
     /// Request body (chat) — for mcp_check the servers config JSON,
     /// for mcp_call the tools/call `params` object.
     body: []const u8 = "",
-    /// mcp_call only: JSON object of extra headers (custom auth etc).
+    /// mcp_call only: JSON object of extra headers (http) or env vars
+    /// (stdio).
     extra: []const u8 = "",
+    /// mcp_call only, stdio transport: JSON array of the child argv
+    /// ([command, arg…]). Empty → HTTP transport via `url`.
+    argv: []const u8 = "",
     /// mcp_call only: conv/msg/call indices echoed into .mcp_call.
     pos_conv: u32 = 0,
     pos_msg: u32 = 0,
@@ -233,6 +237,7 @@ pub const Mailbox = struct {
         if (self.job.api_key.len != 0) self.gpa.free(self.job.api_key);
         if (self.job.body.len != 0) self.gpa.free(self.job.body);
         if (self.job.extra.len != 0) self.gpa.free(self.job.extra);
+        if (self.job.argv.len != 0) self.gpa.free(self.job.argv);
         // `msg` is session-owned — never freed here.
     }
 };
