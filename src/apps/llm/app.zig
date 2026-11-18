@@ -389,6 +389,19 @@ pub const LlmDeps = struct {
         try on_cfg_tools_json(s, null, tools.example_tools_json, null);
     }
 
+    /// `set_sysprompt` — select `change` → value = preset id → fill
+    /// cfg.system. "custom" is a no-op (keeps hand-written text).
+    pub fn on_set_sysprompt(s: *Session, arg: ?[]const u8, value: ?[]const u8, fields: ?*const std.json.ObjectMap) !void {
+        _ = arg;
+        _ = fields;
+        const v = std.mem.trim(u8, value orelse return error.InvalidAction, " \t");
+        if (std.mem.eql(u8, v, "custom")) return; // keep hand-written text
+        const p = presets.findSysprompt(v) orelse return error.InvalidAction;
+        state.setStr(s.gpa, &s.deps.cfg.system, p.text);
+        noteFmt(s, "sys", "system prompt: {s}", .{p.label});
+        s.deps.ping.emit(.{});
+    }
+
     /// `clear_key` — wipe the api key.
     pub fn on_clear_key(s: *Session, arg: ?[]const u8, value: ?[]const u8, fields: ?*const std.json.ObjectMap) !void {
         _ = arg;

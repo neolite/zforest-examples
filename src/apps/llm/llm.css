@@ -179,3 +179,9 @@ textarea { resize: vertical; font-family: var(--mono); font-size: 12px; }
 
 /* bound-leaf visibility toggles — elements stay mounted, class diffs flip display */
 .hidden { display: none !important; }
+
+/* collapsible inspector rows (<details>) */
+.insp-sum { cursor: pointer; display: flex; gap: 8px; align-items: baseline; }
+.insp-prev { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis;
+    white-space: nowrap; color: var(--dim); font-size: 11px; }
+details.insp-row > summary::-webkit-details-marker { color: var(--dim); }

@@ -26,6 +26,7 @@ pub const act = struct {
     pub const set_preset = "set_preset";
     pub const fetch_models = "fetch_models";
     pub const load_tools_example = "load_tools_example";
+    pub const set_sysprompt = "set_sysprompt";
     pub const clear_key = "clear_key";
     pub const clear_chat = "clear_chat";
 };
@@ -61,6 +62,7 @@ pub fn dispatch(
     if (std.mem.eql(u8, action, act.set_preset)) return D.on_set_preset(s, arg, value, fields);
     if (std.mem.eql(u8, action, act.fetch_models)) return D.on_fetch_models(s, arg, value, fields);
     if (std.mem.eql(u8, action, act.load_tools_example)) return D.on_load_tools_example(s, arg, value, fields);
+    if (std.mem.eql(u8, action, act.set_sysprompt)) return D.on_set_sysprompt(s, arg, value, fields);
     if (std.mem.eql(u8, action, act.clear_key)) return D.on_clear_key(s, arg, value, fields);
     if (std.mem.eql(u8, action, act.clear_chat)) return D.on_clear_chat(s, arg, value, fields);
     return error.InvalidAction;

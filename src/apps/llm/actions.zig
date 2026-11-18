@@ -22,6 +22,7 @@ pub const actions = .{
     "set_preset",
     "fetch_models",
     "load_tools_example",
+    "set_sysprompt",
     "clear_key",
     "clear_chat",
 };

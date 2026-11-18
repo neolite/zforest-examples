@@ -154,12 +154,18 @@ fn sideBar(a: std.mem.Allocator, s: *Session) forest.Node {
                 h.button(a).class("btn mini").on(.click, act.clear_key).child("clear").node(),
             }).node()),
             field(a, "Model", modelControl(a, s)),
-            field(a, "System prompt", h.textarea(a)
-                .id("cfg-system")
-                .attr("rows", "3")
-                .value(s.deps.cfg.system)
-                .child(s.deps.cfg.system)
-                .on(.change, act.cfg_system).node()),
+            field(a, "System prompt", h.div(a).children(.{
+                h.select(a)
+                    .on(.change, act.set_sysprompt)
+                    .child(syspromptOptions(a, s))
+                    .node(),
+                h.textarea(a)
+                    .id("cfg-system")
+                    .attr("rows", "3")
+                    .value(s.deps.cfg.system)
+                    .child(s.deps.cfg.system)
+                    .on(.change, act.cfg_system).node(),
+            }).node()),
             h.div(a).class("grid2").children(.{
                 field(a, "Temperature", h.input(a)
                     .id("cfg-temp")
@@ -205,6 +211,37 @@ fn presetValue(s: *Session) []const u8 {
         if (std.mem.eql(u8, p.base_url, s.deps.cfg.base_url)) return p.id;
     }
     return "custom";
+}
+
+/// System-prompt preset picker: matches cfg.system against the known
+/// preset texts — a hand-written prompt selects "custom…".
+fn syspromptValue(s: *Session) []const u8 {
+    for (presets.sysprompts) |p| {
+        if (std.mem.eql(u8, p.text, s.deps.cfg.system)) return p.id;
+    }
+    return "custom";
+}
+
+fn syspromptOptions(a: std.mem.Allocator, s: *Session) forest.Node {
+    const cur = syspromptValue(s);
+    var opts: std.ArrayListUnmanaged(forest.Node) = .empty;
+    if (std.mem.eql(u8, cur, "custom")) {
+        opts.append(a, h.option(a)
+            .id("sp-custom")
+            .value("custom")
+            .attr("selected", true)
+            .child("custom (current text)")
+            .node()) catch @panic("OOM");
+    }
+    for (presets.sysprompts) |p| {
+        opts.append(a, h.option(a)
+            .id(h.f(a, "sp-{s}", .{p.id}))
+            .value(p.id)
+            .attr("selected", std.mem.eql(u8, p.id, cur))
+            .child(p.label)
+            .node()) catch @panic("OOM");
+    }
+    return h.fragment(a, opts.items);
 }
 
 fn presetOptions(a: std.mem.Allocator, s: *Session) forest.Node {
@@ -582,6 +619,10 @@ fn usageBox(a: std.mem.Allocator, s: *Session) forest.Node {
 
 /// Keyed inspector rows — `seq` on each entry gives a stable id, so
 /// appends create one row and ring-cap eviction removes the oldest.
+/// Rows are immutable once appended → plain static children; the
+/// `<details>` wrapper gives collapse-for-free (DOM holds open state,
+/// no patches involved). SSE chunks arrive one-per-delta and flood the
+/// log, so they mount collapsed; req/err/sys/tool stay expanded.
 fn inspRows(a: std.mem.Allocator, s: *Session) forest.Children {
     const items = s.deps.inspector.items;
     const start = if (items.len > 80) items.len - 80 else 0;
@@ -590,20 +631,21 @@ fn inspRows(a: std.mem.Allocator, s: *Session) forest.Children {
 
 fn inspRow(a: std.mem.Allocator, s: *Session, e: app.InspectorEntry) ?forest.Node {
     _ = s;
-    return h.div(a)
+    const line = std.mem.sliceTo(e.text, '\n');
+    const preview = line[0..@min(line.len, 90)];
+    return h.details(a)
         .class("insp-row")
         .id(h.f(a, "insp-{d}", .{e.seq}))
+        .attr("open", !std.mem.eql(u8, e.kind, "sse"))
         .children(.{
-            h.span(a)
-                .lid("kind")
-                .class(h.f(a, "insp-kind k-{s}", .{e.kind}))
-                .text(e.kind)
-                .node(),
-            h.pre(a)
-                .lid("text")
-                .class("mono insp-text")
-                .text(e.text)
-                .node(),
+            h.summary(a).class("insp-sum").children(.{
+                h.span(a)
+                    .class(h.f(a, "insp-kind k-{s}", .{e.kind}))
+                    .child(e.kind)
+                    .node(),
+                h.span(a).class("insp-prev mono").child(preview).node(),
+            }).node(),
+            h.pre(a).class("mono insp-text").child(e.text).node(),
         })
         .node();
 }

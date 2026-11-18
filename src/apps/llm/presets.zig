@@ -27,6 +27,33 @@ pub fn find(id: []const u8) ?Preset {
     return null;
 }
 
+// ── system prompt presets ────────────────────────────────────────
+
+pub const Sysprompt = struct {
+    id: []const u8,
+    label: []const u8,
+    text: []const u8,
+};
+
+/// One-shot fills for the system prompt textarea — "custom" is not
+/// listed: it only appears as the select's fallback when the textarea
+/// holds hand-written text.
+pub const sysprompts = [_]Sysprompt{
+    .{ .id = "assistant", .label = "Helpful assistant", .text = "You are a helpful assistant. Answer clearly and concisely. If you are unsure, say so instead of guessing." },
+    .{ .id = "terse", .label = "Terse", .text = "You are a terse assistant. Answer in as few words as possible. No pleasantries, no filler." },
+    .{ .id = "eli5", .label = "Explain like I'm 5", .text = "Explain concepts like I'm five years old: simple words, everyday analogies, short sentences. Still be accurate." },
+    .{ .id = "code_review", .label = "Code reviewer", .text = "You are a senior code reviewer. Analyze the code for bugs, edge cases, security issues and style problems. Be specific: quote the line, explain the risk, suggest a fix." },
+    .{ .id = "tool_user", .label = "Tool-using agent", .text = "You are an agent with access to tools. Prefer calling a tool over guessing facts you can look up. After a tool result, continue your answer naturally. Explain what you did in one short sentence." },
+    .{ .id = "socratic", .label = "Socratic tutor", .text = "You are a Socratic tutor. Don't give the answer directly — ask guiding questions that lead the student to it. One question at a time." },
+};
+
+pub fn findSysprompt(id: []const u8) ?Sysprompt {
+    for (sysprompts) |p| {
+        if (std.mem.eql(u8, p.id, id)) return p;
+    }
+    return null;
+}
+
 test "preset ids unique and findable" {
     try std.testing.expect(find("deepseek") != null);
     try std.testing.expect(find("nope") == null);
