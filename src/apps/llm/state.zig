@@ -506,3 +506,107 @@ test "estTokens approximates chars/4" {
     const msgs = [_]*Msg{m};
     try std.testing.expectEqual(@as(u64, 4), estTokens(&msgs, 8)); // +2 from system
 }
+
+// ── inspector JSON pretty-print ──────────────────────────────────
+
+/// Lexical JSON indenter — JS `JSON.stringify(v, null, 2)` style.
+/// No parse: strings/escapes are tracked so structural chars inside
+/// string values never trigger reformatting, key order is preserved.
+/// Non-JSON input (first non-ws char isn't '{' — chat payloads are
+/// always objects; '[DONE]'-style sentinels pass through) returns an
+/// unchanged dupe — callers always own the result.
+pub fn prettyJson(gpa: std.mem.Allocator, s: []const u8) []u8 {
+    var i: usize = 0;
+    while (i < s.len and std.ascii.isWhitespace(s[i])) : (i += 1) {}
+    if (i >= s.len or s[i] != '{') return gpa.dupe(u8, s) catch @panic("OOM");
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    var indent: usize = 0;
+    var in_str = false;
+    var esc = false;
+    // Last significant byte emitted — detects empty `{}`/`[]` pairs.
+    var last: u8 = 0;
+
+    const nl = struct {
+        fn emit(o: *std.ArrayListUnmanaged(u8), g: std.mem.Allocator, n: usize) void {
+            o.append(g, '\n') catch @panic("OOM");
+            var k: usize = 0;
+            while (k < n * 2) : (k += 1) o.append(g, ' ') catch @panic("OOM");
+        }
+    }.emit;
+
+    while (i < s.len) : (i += 1) {
+        const c = s[i];
+        if (in_str) {
+            out.append(gpa, c) catch @panic("OOM");
+            last = c;
+            if (esc) esc = false else if (c == '\\') esc = true else if (c == '"') in_str = false;
+            continue;
+        }
+        switch (c) {
+            ' ', '\t', '\r', '\n' => continue, // reformat whitespace
+            '"' => {
+                in_str = true;
+                out.append(gpa, c) catch @panic("OOM");
+                last = c;
+            },
+            '{', '[' => {
+                out.append(gpa, c) catch @panic("OOM");
+                last = c;
+                // Empty pair? peek past whitespace — `}`/`]` stays inline.
+                var j = i + 1;
+                while (j < s.len and std.ascii.isWhitespace(s[j])) : (j += 1) {}
+                if (j < s.len and s[j] != '}' and s[j] != ']') {
+                    indent += 1;
+                    nl(&out, gpa, indent);
+                }
+            },
+            '}', ']' => {
+                if (last == '{' or last == '[') {
+                    // Empty pair — the opener took no indent, take none.
+                } else {
+                    indent -|= 1;
+                    nl(&out, gpa, indent);
+                }
+                out.append(gpa, c) catch @panic("OOM");
+                last = c;
+            },
+            ',' => {
+                out.append(gpa, c) catch @panic("OOM");
+                last = c;
+                nl(&out, gpa, indent);
+            },
+            ':' => {
+                out.append(gpa, ':') catch @panic("OOM");
+                out.append(gpa, ' ') catch @panic("OOM");
+                last = ' ';
+            },
+            else => {
+                out.append(gpa, c) catch @panic("OOM");
+                last = c;
+            },
+        }
+    }
+    // toOwnedSlice: the returned slice must BE the allocation —
+    // out.items can be shorter than capacity and gpa.free would
+    // reject it.
+    return out.toOwnedSlice(gpa) catch @panic("OOM");
+}
+
+test "prettyJson indents like JSON.stringify(…, null, 2)" {
+    const gpa = std.testing.allocator;
+    const src = "{\"a\":1,\"b\":[true,\"x,y\"],\"c\":{},\"d\":\"}\"}";
+    const p = prettyJson(gpa, src);
+    defer gpa.free(p);
+    try std.testing.expectEqualStrings(
+        "{\n  \"a\": 1,\n  \"b\": [\n    true,\n    \"x,y\"\n  ],\n  \"c\": {},\n  \"d\": \"}\"\n}",
+        p,
+    );
+}
+
+test "prettyJson passes non-JSON through" {
+    const gpa = std.testing.allocator;
+    const p = prettyJson(gpa, "[DONE]");
+    defer gpa.free(p);
+    try std.testing.expectEqualStrings("[DONE]", p);
+}
