@@ -34,6 +34,17 @@ pub fn head(
     w.writeAll("<style>") catch @panic("OOM");
     w.writeAll(app.llm_css) catch @panic("OOM");
     w.writeAll("</style>\n") catch @panic("OOM");
+    // API key lives in the browser's localStorage (never rendered into
+    // HTML): on load it is written into the password field and a
+    // synthetic change replays it through the normal cfg_api_key
+    // action; every later change persists back. Capturing listener so
+    // it works regardless of client.js delegation order.
+    w.writeAll("<script>(function(){var K='zllm_api_key',I='api-key-input';" ++
+        "document.addEventListener('change',function(e){" ++
+        "if(e.target&&e.target.id===I){try{localStorage.setItem(K,e.target.value)}catch(x){}}},true);" ++
+        "window.addEventListener('DOMContentLoaded',function(){try{var k=localStorage.getItem(K);" ++
+        "if(k){var i=document.getElementById(I);if(i){i.value=k;" ++
+        "i.dispatchEvent(new Event('change',{bubbles:true}));}}}catch(e){}});})();</script>\n") catch @panic("OOM");
     return .{
         .title = "zllm — LLM endpoint playground",
         .extra = aw.toOwnedSlice() catch @panic("OOM"),
@@ -111,10 +122,12 @@ fn sideBar(a: std.mem.Allocator, s: *Session) forest.Node {
         }).node(),
         h.section(a).class("card").children(.{
             h.h2(a).child("Endpoint").node(),
+            endpointStatus(a, s),
             field(a, "Preset", h.select(a)
                 .on(.change, act.set_preset)
                 .child(presetOptions(a, s))
                 .node()),
+            h.p(a).class("hint").child("preset fills base URL, model & context window — you still need an API key").node(),
             field(a, "Base URL", h.input(a)
                 .class("mono")
                 .placeholder("https://api.openai.com/v1")
@@ -122,6 +135,7 @@ fn sideBar(a: std.mem.Allocator, s: *Session) forest.Node {
                 .on(.change, act.cfg_base_url).node()),
             field(a, "API key", h.div(a).class("keyrow").children(.{
                 h.input(a)
+                    .id("api-key-input")
                     .class("mono")
                     .type("password")
                     .placeholder(if (s.deps.key_from_env) "from env (ZLLM_API_KEY)" else "sk-…")
@@ -130,12 +144,7 @@ fn sideBar(a: std.mem.Allocator, s: *Session) forest.Node {
                 h.button(a).class("btn mini").on(.click, act.fetch_models).child("models").node(),
                 h.button(a).class("btn mini").on(.click, act.clear_key).child("clear").node(),
             }).node()),
-            field(a, "Model", h.input(a)
-                .class("mono")
-                .placeholder("model id")
-                .value(s.deps.cfg.model)
-                .on(.change, act.cfg_model).node()),
-            modelsHint(a, s),
+            field(a, "Model", modelControl(a, s)),
             field(a, "System prompt", h.textarea(a)
                 .attr("rows", "3")
                 .value(s.deps.cfg.system)
@@ -197,21 +206,59 @@ fn presetOptions(a: std.mem.Allocator, s: *Session) forest.Node {
     return h.fragment(a, opts.items);
 }
 
-/// Fetched /models ids as a hint line (clickable chips would need a
-/// use_model action — v2). Shows count + first few ids.
-fn modelsHint(a: std.mem.Allocator, s: *Session) forest.Node {
-    if (s.deps.models.len == 0) return h.div(a).node();
-    var ids: std.ArrayListUnmanaged(u8) = .empty;
-    defer ids.deinit(a);
-    const n = @min(s.deps.models.len, 6);
-    for (s.deps.models[0..n], 0..) |id, i| {
-        if (i != 0) ids.appendSlice(a, ", ") catch @panic("OOM");
-        ids.appendSlice(a, id) catch @panic("OOM");
+/// Endpoint health line — last wire operation outcome so the user
+/// sees at a glance whether the provider was reached.
+fn endpointStatus(a: std.mem.Allocator, s: *Session) forest.Node {
+    const e = s.deps.endpoint;
+    return switch (e.kind) {
+        .idle => h.div(a).class("ep-status ep-idle")
+            .child("no endpoint test yet — pick a preset, add a key, then “models” or send")
+            .node(),
+        .busy => h.div(a).class("ep-status ep-busy")
+            .child(h.f(a, "… {s}", .{e.text})).node(),
+        .ok => h.div(a).class("ep-status ep-ok")
+            .child(h.f(a, "✓ {s}", .{e.text})).node(),
+        .err => h.div(a).class("ep-status ep-err")
+            .child(h.f(a, "✗ {s}", .{e.text})).node(),
+    };
+}
+
+/// Model picker: a <select> over the fetched /models ids once they
+/// exist, a plain text input before that (custom endpoints without
+/// /models still work).
+fn modelControl(a: std.mem.Allocator, s: *Session) forest.Node {
+    const cur = s.deps.cfg.model;
+    if (s.deps.models.len == 0) {
+        return h.input(a)
+            .class("mono")
+            .placeholder("model id")
+            .value(cur)
+            .on(.change, act.cfg_model).node();
     }
-    if (s.deps.models.len > n) {
-        ids.appendSlice(a, "…") catch @panic("OOM");
+    const g = a;
+    var opts: std.ArrayListUnmanaged(forest.Node) = .empty;
+    var listed = false;
+    if (cur.len != 0) {
+        for (s.deps.models) |id| {
+            if (std.mem.eql(u8, id, cur)) {
+                listed = true;
+                break;
+            }
+        }
     }
-    return h.p(a).class("hint").child(h.f(a, "{d} model(s): {s}", .{ s.deps.models.len, ids.items })).node();
+    if (cur.len == 0) {
+        opts.append(g, h.option(a).value("").attr("selected", true).child("— pick a model —").node()) catch @panic("OOM");
+    } else if (!listed) {
+        opts.append(g, h.option(a).value(cur).attr("selected", true).child(h.f(a, "{s} (current)", .{cur})).node()) catch @panic("OOM");
+    }
+    for (s.deps.models) |id| {
+        opts.append(g, h.option(a)
+            .value(id)
+            .attr("selected", std.mem.eql(u8, id, cur))
+            .child(id)
+            .node()) catch @panic("OOM");
+    }
+    return h.select(a).on(.change, act.cfg_model).child(h.fragment(a, opts.items)).node();
 }
 
 fn field(a: std.mem.Allocator, label: []const u8, control: forest.Node) forest.Node {

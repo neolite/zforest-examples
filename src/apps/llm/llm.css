@@ -21,6 +21,10 @@
 html, body { margin: 0; padding: 0; background: var(--bg); color: var(--text);
     font: 14px/1.5 -apple-system, "Segoe UI", Inter, Roboto, sans-serif; }
 
+/* Base style.css constrains .app to 34rem centered — the console
+   needs the full viewport. */
+.app-llm { max-width: none; margin: 0; width: 100%; }
+
 .llm { display: grid; grid-template-columns: 300px 1fr 380px; height: 100vh; }
 
 /* ── shared bits ─────────────────────────────────────────────── */
@@ -54,6 +58,14 @@ input:focus, textarea:focus, select:focus { outline: none; border-color: var(--a
 textarea { resize: vertical; font-family: var(--mono); font-size: 12px; }
 .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 0 10px; }
 .keyrow { display: flex; align-items: center; gap: 4px; }
+
+/* endpoint health line */
+.ep-status { font-size: 12px; padding: 6px 9px; border-radius: 7px;
+    margin-bottom: 9px; }
+.ep-idle { color: var(--dim); border: 1px dashed var(--border); }
+.ep-busy { color: var(--accent); }
+.ep-ok { color: var(--green); }
+.ep-err { color: var(--red); }
 .keyrow input { flex: 1; }
 
 /* ── sidebar ─────────────────────────────────────────────────── */

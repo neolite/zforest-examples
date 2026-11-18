@@ -245,7 +245,7 @@ pub fn worker(mb: *state.Mailbox) void {
         job.body);
 
     var req = client.request(method, uri, .{
-        .keep_alive = false,
+        .keep_alive = true,
         .extra_headers = hdrs,
     }) catch |e| {
         pushErr(mb, "connect failed: {s}", .{@errorName(e)});
@@ -307,7 +307,7 @@ pub fn worker(mb: *state.Mailbox) void {
     defer acc.buf.deinit(gpa);
     var saw_done = false;
     var rx_any = false;
-    while (mb.alive.load(.seq_cst) and !mb.cancel.load(.seq_cst)) {
+    while (mb.alive.load(.seq_cst) and !mb.cancel.load(.seq_cst) and !saw_done) {
         const line = rdr.takeDelimiter('\n') catch |e| switch (e) {
             error.ReadFailed => {
                 // With `connection: close` the peer may FIN right after

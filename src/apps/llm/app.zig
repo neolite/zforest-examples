@@ -44,6 +44,12 @@ pub const InspectorEntry = struct {
     text: []const u8,
 };
 
+pub const EndpointState = enum { idle, busy, ok, err };
+pub const EndpointStatus = struct {
+    kind: EndpointState = .idle,
+    text: []const u8 = "",
+};
+
 pub const LlmDeps = struct {
     pub const page_title = "zllm";
     pub const page_class = "app app-llm";
@@ -69,6 +75,9 @@ pub const LlmDeps = struct {
     tool_turns: u32 = 0,
     /// True while cfg.api_key came from env (UI shows "env" tag).
     key_from_env: bool = false,
+    /// Last endpoint operation result — the visible "did it connect"
+    /// signal in the Endpoint card.
+    endpoint: EndpointStatus = .{},
 
     ping: *zefx.Event(Ping),
 
@@ -115,6 +124,7 @@ pub const LlmDeps = struct {
         tools.freeDefs(g, s.deps.tool_defs);
         for (s.deps.models) |id| g.free(id);
         if (s.deps.models.len != 0) g.free(s.deps.models);
+        state.freeStr(g, s.deps.endpoint.text);
         for (s.deps.inspector.items) |e| g.free(e.text);
         s.deps.inspector.deinit(g);
         // send_queue entries are *Msg owned by their Conversation —
@@ -351,6 +361,7 @@ pub const LlmDeps = struct {
         if (s.deps.cfg.base_url.len == 0) return error.ConfigRequired;
         if (s.deps.mailbox != null) return error.Busy;
         if (!spawnModels(s)) return error.SpawnFailed;
+        endpointFmt(s, .busy, "GET /models…", .{});
         note(s, "sys", "fetching /models…");
         s.deps.ping.emit(.{});
     }
@@ -437,6 +448,14 @@ fn noteOwned(s: *Session, comptime kind: []const u8, text: []const u8) void {
 }
 
 /// noteFmt — allocPrint then adopt (no double-alloc leak).
+/// Endpoint-card status: last wire operation outcome (fetch/chat).
+fn endpointFmt(s: *Session, kind: EndpointState, comptime fmt: []const u8, args: anytype) void {
+    const t = std.fmt.allocPrint(s.gpa, fmt, args) catch return;
+    defer s.gpa.free(t);
+    s.deps.endpoint.kind = kind;
+    state.setStr(s.gpa, &s.deps.endpoint.text, t);
+}
+
 fn noteFmt(s: *Session, comptime kind: []const u8, comptime fmt: []const u8, args: anytype) void {
     const t = std.fmt.allocPrint(s.gpa, fmt, args) catch return;
     noteOwned(s, kind, t);
@@ -751,6 +770,11 @@ fn applyEv(s: *Session, mb: *state.Mailbox, ev: state.Ev) bool {
             for (s.deps.models) |id| g.free(id);
             if (s.deps.models.len != 0) g.free(s.deps.models);
             s.deps.models = copy;
+            endpointFmt(s, .ok, "{d} model(s) loaded", .{ids.len});
+            // Empty model field → adopt the first fetched id so the
+            // user never has to type a model name by hand.
+            if (s.deps.cfg.model.len == 0 and s.deps.models.len != 0)
+                state.setStr(g, &s.deps.cfg.model, s.deps.models[0]);
             noteFmt(s, "sys", "{d} model(s) loaded", .{ids.len});
             return true;
         },
@@ -794,12 +818,14 @@ fn applyEv(s: *Session, mb: *state.Mailbox, ev: state.Ev) bool {
         },
         .done => {
             am.status = .ok;
+            endpointFmt(s, .ok, "stream finished", .{});
             return true;
         },
         .err => |e| {
             am.status = .failed;
             if (am.err) |old| state.freeStr(g, old);
             am.err = state.dupe(g, e);
+            endpointFmt(s, .err, "{s}", .{e});
             return true;
         },
         // .raw/.models returned early above — unreachable here.
