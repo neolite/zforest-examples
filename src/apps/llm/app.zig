@@ -132,6 +132,13 @@ pub const LlmDeps = struct {
     /// Code-mode background processes (proc_start/output/list/kill).
     procs: std.ArrayListUnmanaged(Proc) = .empty,
     proc_seq: u32 = 1,
+    /// Cached repo-context block for code mode (keyed by workspace).
+    repo_ctx: []const u8 = "",
+    repo_ctx_ws: []const u8 = "",
+    /// Session cookie token — stable id for file persistence.
+    sess_token: []const u8 = "",
+    persist_loaded: bool = false,
+    last_persist_ms: i64 = 0,
 
     ping: *zefx.Event(Ping),
 
@@ -153,6 +160,11 @@ pub const LlmDeps = struct {
             .mcp_mb = null,
             .procs = .empty,
             .proc_seq = 1,
+            .repo_ctx = "",
+            .repo_ctx_ws = "",
+            .sess_token = "",
+            .persist_loaded = false,
+            .last_persist_ms = 0,
             .ping = s.app.createEvent(Ping),
         };
         // gpa-own every default so deinit can free uniformly.
@@ -211,6 +223,10 @@ pub const LlmDeps = struct {
             g.destroy(p.child);
         }
         s.deps.procs.deinit(g);
+        state.freeStr(g, s.deps.repo_ctx);
+        state.freeStr(g, s.deps.repo_ctx_ws);
+        persistSave(s); // flush final state before teardown (needs sess_token)
+        state.freeStr(g, s.deps.sess_token);
     }
 
     pub fn wire(s: *Session) void {
@@ -576,6 +592,7 @@ pub const Session = Skel;
 
 fn onPing(s: *Session, _: Ping) void {
     s.bumpSeq();
+    persistSave(s); // throttled to 2s internally
 }
 
 pub fn curConv(s: *Session) *state.Conversation {
@@ -812,7 +829,23 @@ fn spawnChat(s: *Session, target: ?*state.Msg) bool {
     const conv = curConv(s);
     const tp = toolsPayload(s);
     defer if (tp.len != 0) g.free(tp);
-    const body = state.buildRequest(g, &s.deps.cfg, conv.msgs.items, tp);
+    // Code mode: prepend the cached repo snapshot to the system text.
+    var cfg_eff = s.deps.cfg;
+    var sys_eff: ?[]const u8 = null;
+    if (s.deps.cfg.agent_mode == .code) {
+        if (repoContext(s)) |rc| {
+            sys_eff = std.fmt.allocPrint(g, "{s}\n\n{s}", .{ rc, s.deps.cfg.system }) catch null;
+            if (sys_eff) |se| cfg_eff.system = se;
+        }
+    }
+    defer if (sys_eff) |se| g.free(se);
+    // Compact from the front when the estimate nears the window.
+    var comp = compactMsgs(s, conv, cfg_eff.system.len, tp.len);
+    defer {
+        if (comp.owned) |*l| l.deinit(g);
+        if (comp.marker) |mk| state.msgFree(g, mk);
+    }
+    const body = state.buildRequest(g, &cfg_eff, comp.msgs, tp);
     const url = state.completionsUrl(g, s.deps.cfg.base_url);
     const key = state.dupe(g, s.deps.cfg.api_key);
 
@@ -1096,12 +1129,18 @@ fn procStart(s: *Session, obj: ?std.json.ObjectMap) []const u8 {
     const cmd = tools.argStr(obj, "command") orelse return state.dupe(g, "error: missing 'command'");
     if (cmd.len == 0 or cmd.len > 4000) return state.dupe(g, "error: command empty or too long");
     const argv = [_][]const u8{ "sh", "-c", cmd };
+    const em = tools.scrubbedEnv(g);
+    defer if (em) |m| {
+        m.deinit();
+        g.destroy(m);
+    };
     var child = std.process.spawn(s.io, .{
         .argv = &argv,
         .stdin = .ignore,
         .stdout = .pipe,
         .stderr = .pipe,
         .cwd = if (s.deps.cfg.workspace.len != 0) .{ .path = s.deps.cfg.workspace } else .inherit,
+        .environ_map = em,
     }) catch return state.dupe(g, "error: spawn failed");
     const id = s.deps.proc_seq;
     s.deps.proc_seq +%= 1;
@@ -1178,6 +1217,390 @@ fn procKill(s: *Session, obj: ?std.json.ObjectMap) []const u8 {
     p.code = -1;
     p.eof = .{ true, true };
     return std.fmt.allocPrint(g, "proc {d} killed", .{p.id}) catch @panic("OOM");
+}
+
+// ── code-mode repo context ───────────────────────────────────────
+
+/// Run `sh -c cmd` capturing stdout (stderr dropped), ~3s deadline.
+/// Returns gpa-owned output or null. Used for git/ls probes only.
+fn captureCmd(s: *Session, cmd: []const u8, timeout_ms: u64) ?[]const u8 {
+    const g = s.gpa;
+    const argv = [_][]const u8{ "sh", "-c", cmd };
+    const em = tools.scrubbedEnv(g);
+    defer if (em) |m| {
+        m.deinit();
+        g.destroy(m);
+    };
+    var child = std.process.spawn(s.io, .{
+        .argv = &argv,
+        .stdin = .ignore,
+        .stdout = .pipe,
+        .stderr = .ignore,
+        .cwd = if (s.deps.cfg.workspace.len != 0) .{ .path = s.deps.cfg.workspace } else .inherit,
+        .environ_map = em,
+    }) catch return null;
+    defer child.kill(s.io);
+    const so = child.stdout orelse return null;
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(g);
+    var chunk: [8192]u8 = undefined;
+    const start = Io.Clock.real.now(s.io);
+    var eof = false;
+    while (!eof) {
+        if (Io.Clock.real.now(s.io).toMilliseconds() - start.toMilliseconds() >= @as(i64, @intCast(timeout_ms))) break;
+        var pfds = [_]std.posix.pollfd{.{ .fd = so.handle, .events = std.posix.POLL.IN, .revents = 0 }};
+        _ = std.posix.poll(&pfds, 100) catch break;
+        if (pfds[0].revents == 0) continue;
+        const n = std.posix.read(so.handle, &chunk) catch {
+            eof = true;
+            continue;
+        };
+        if (n == 0) {
+            eof = true;
+            continue;
+        }
+        if (out.items.len < 16 * 1024) {
+            const room = 16 * 1024 - out.items.len;
+            out.appendSlice(g, chunk[0..@min(n, room)]) catch {};
+        }
+    }
+    return out.toOwnedSlice(g) catch null;
+}
+
+/// Repo snapshot for code mode: branch, dirty status, recent log,
+/// top-level listing — cached per workspace string.
+fn repoContext(s: *Session) ?[]const u8 {
+    const g = s.gpa;
+    const ws = s.deps.cfg.workspace;
+    if (std.mem.eql(u8, s.deps.repo_ctx_ws, ws)) {
+        return if (s.deps.repo_ctx.len != 0) s.deps.repo_ctx else null;
+    }
+    state.freeStr(g, s.deps.repo_ctx);
+    state.freeStr(g, s.deps.repo_ctx_ws);
+    s.deps.repo_ctx_ws = state.dupe(g, ws);
+    s.deps.repo_ctx = "";
+
+    const probe = captureCmd(s, "git rev-parse --is-inside-work-tree 2>/dev/null", 1500);
+    defer if (probe) |p| g.free(p);
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(g);
+    out.appendSlice(g, "Workspace root for this session. ") catch @panic("OOM");
+    if (ws.len != 0) {
+        out.print(g, "Root: {s}. ", .{ws}) catch @panic("OOM");
+    } else {
+        out.appendSlice(g, "Root: current directory. ") catch @panic("OOM");
+    }
+    const in_git = probe != null and std.mem.indexOf(u8, probe.?, "true") != null;
+    if (in_git) {
+        const branch = captureCmd(s, "git branch --show-current 2>/dev/null", 1500);
+        defer if (branch) |b| g.free(b);
+        const status = captureCmd(s, "git status --short 2>/dev/null | head -25", 2000);
+        defer if (status) |st| g.free(st);
+        const log = captureCmd(s, "git log --oneline -3 2>/dev/null", 1500);
+        defer if (log) |l| g.free(l);
+        out.appendSlice(g, "Git repo. ") catch @panic("OOM");
+        if (branch) |b| {
+            const bn = std.mem.trim(u8, b, " \t\r\n");
+            if (bn.len != 0) out.print(g, "Branch: {s}. ", .{bn}) catch @panic("OOM");
+        }
+        if (status) |st| {
+            const stt = std.mem.trim(u8, st, " \t\r\n");
+            if (stt.len != 0) {
+                out.appendSlice(g, "Working tree changes:\n```\n") catch @panic("OOM");
+                out.appendSlice(g, stt) catch @panic("OOM");
+                out.appendSlice(g, "\n```\n") catch @panic("OOM");
+            }
+        }
+        if (log) |l| {
+            const lt = std.mem.trim(u8, l, " \t\r\n");
+            if (lt.len != 0) {
+                out.appendSlice(g, "Recent commits:\n```\n") catch @panic("OOM");
+                out.appendSlice(g, lt) catch @panic("OOM");
+                out.appendSlice(g, "\n```\n") catch @panic("OOM");
+            }
+        }
+    } else {
+        out.appendSlice(g, "Not a git repository. ") catch @panic("OOM");
+    }
+    const listing = captureCmd(s, "ls -A 2>/dev/null | head -40", 1500);
+    defer if (listing) |l| g.free(l);
+    if (listing) |l| {
+        const lt = std.mem.trim(u8, l, " \t\r\n");
+        if (lt.len != 0) {
+            out.appendSlice(g, "Top-level entries:\n```\n") catch @panic("OOM");
+            out.appendSlice(g, lt) catch @panic("OOM");
+            out.appendSlice(g, "\n```\n") catch @panic("OOM");
+        }
+    }
+    if (out.items.len == 0) return null;
+    s.deps.repo_ctx = out.toOwnedSlice(g) catch return null;
+    return s.deps.repo_ctx;
+}
+
+// ── context compaction ───────────────────────────────────────────
+
+/// Estimated tokens of the request payload (system + tools + msgs).
+fn requestEstTokens(msgs: []const *state.Msg, tools_len: usize, sys_len: usize) u64 {
+    return state.estTokens(msgs, sys_len + tools_len);
+}
+
+/// Build the message list for a request, compacting from the front
+/// when the estimate exceeds 75% of the context window. Drop units
+/// are whole turns: an assistant msg with tool_calls takes its
+/// trailing tool msgs with it (the API rejects orphan tool msgs).
+/// Returns gpa-owned slice of *Msg plus an optional marker Msg the
+/// caller must keep alive — both freed by the caller's arena scope.
+fn compactMsgs(s: *Session, conv: *state.Conversation, sys_len: usize, tools_len: usize) struct { msgs: []const *state.Msg, owned: ?std.ArrayListUnmanaged(*state.Msg), marker: ?*state.Msg } {
+    const g = s.gpa;
+    const budget = @as(u64, s.deps.cfg.context_window) * 3 / 4;
+    const est = requestEstTokens(conv.msgs.items, tools_len, sys_len);
+    if (est <= budget or conv.msgs.items.len <= 2) {
+        return .{ .msgs = conv.msgs.items, .owned = null, .marker = null };
+    }
+    // Group into drop units.
+    var units: std.ArrayListUnmanaged([]const *state.Msg) = .empty;
+    defer units.deinit(g);
+    var i: usize = 0;
+    while (i < conv.msgs.items.len) {
+        const start = i;
+        i += 1;
+        const m = conv.msgs.items[start];
+        if (m.role == .assistant and m.calls.items.len != 0) {
+            while (i < conv.msgs.items.len and conv.msgs.items[i].role == .tool) i += 1;
+        }
+        units.append(g, conv.msgs.items[start..i]) catch @panic("OOM");
+    }
+    // Never drop the last unit (current turn).
+    var drop: usize = 0;
+    var kept_est = est;
+    while (drop + 1 < units.items.len) {
+        var unit_est: u64 = 0;
+        for (units.items[drop]) |m| unit_est += state.estTokens(&[_]*state.Msg{m}, 0);
+        if (kept_est -| unit_est <= budget) break;
+        kept_est -|= unit_est;
+        drop += 1;
+    }
+    if (drop == 0) return .{ .msgs = conv.msgs.items, .owned = null, .marker = null };
+    const dropped: usize = blk: {
+        var n: usize = 0;
+        for (units.items[0..drop]) |u| n += u.len;
+        break :blk n;
+    };
+    const marker_text = std.fmt.allocPrint(g, "[…{d} earlier message(s) omitted to fit the context window]", .{dropped}) catch @panic("OOM");
+    const marker = state.msgNew(g, .user);
+    marker.text.appendSlice(g, marker_text) catch @panic("OOM");
+    g.free(marker_text);
+    var list: std.ArrayListUnmanaged(*state.Msg) = .empty;
+    list.append(g, marker) catch @panic("OOM");
+    for (units.items[drop..]) |u| {
+        for (u) |m| list.append(g, m) catch @panic("OOM");
+    }
+    return .{ .msgs = list.items, .owned = list, .marker = marker };
+}
+
+// ── file persistence ─────────────────────────────────────────────
+
+fn persistPath(s: *Session) ?[]const u8 {
+    if (s.deps.sess_token.len == 0) return null;
+    var ok = true;
+    for (s.deps.sess_token) |c| {
+        if (!std.ascii.isAlphanumeric(c) and c != '_' and c != '-') ok = false;
+    }
+    if (!ok) return null;
+    return std.fmt.allocPrint(s.gpa, "zllm-data/{s}.json", .{s.deps.sess_token}) catch null;
+}
+
+const PMsg = struct {
+    role: []const u8,
+    text: []const u8 = "",
+    reasoning: []const u8 = "",
+    call_id: ?[]const u8 = null,
+    tool_name: ?[]const u8 = null,
+    status: []const u8 = "ok",
+    calls: []PCall = &.{},
+};
+const PCall = struct {
+    id: []const u8,
+    name: []const u8,
+    args_json: []const u8 = "",
+    state: []const u8 = "pending",
+    result: ?[]const u8 = null,
+};
+const PConv = struct { title: []const u8, msgs: []PMsg };
+const PCfg = struct {
+    base_url: []const u8 = "",
+    model: []const u8 = "",
+    system: []const u8 = "",
+    temperature: f64 = 0.7,
+    top_p: f64 = 1.0,
+    context_window: u32 = 64000,
+    tool_mode: []const u8 = "manual",
+    agent_mode: []const u8 = "chat",
+    workspace: []const u8 = "",
+    tools_json: []const u8 = "",
+    mcp_servers: []const u8 = "",
+};
+const PState = struct {
+    convs: []PConv,
+    active: u32,
+    cfg: PCfg,
+};
+
+fn msgToP(g: std.mem.Allocator, m: *const state.Msg) PMsg {
+    var calls: std.ArrayListUnmanaged(PCall) = .empty;
+    for (m.calls.items) |c| {
+        calls.append(g, .{
+            .id = c.id,
+            .name = c.name,
+            .args_json = c.args_json.items,
+            .state = @tagName(c.state),
+            .result = c.result,
+        }) catch @panic("OOM");
+    }
+    return .{
+        .role = @tagName(m.role),
+        .text = m.text.items,
+        .reasoning = m.reasoning.items,
+        .call_id = m.call_id,
+        .tool_name = m.tool_name,
+        .status = @tagName(m.status),
+        .calls = calls.items,
+    };
+}
+
+fn pToMsg(g: std.mem.Allocator, pm: PMsg) *state.Msg {
+    const role: state.Role = if (std.mem.eql(u8, pm.role, "assistant")) .assistant else if (std.mem.eql(u8, pm.role, "tool")) .tool else .user;
+    const m = state.msgNew(g, role);
+    m.text.appendSlice(g, pm.text) catch @panic("OOM");
+    m.reasoning.appendSlice(g, pm.reasoning) catch @panic("OOM");
+    if (pm.call_id) |cid| m.call_id = state.dupe(g, cid);
+    if (pm.tool_name) |tn| m.tool_name = state.dupe(g, tn);
+    m.status = if (std.mem.eql(u8, pm.status, "failed")) .failed else if (std.mem.eql(u8, pm.status, "streaming")) .streaming else .ok;
+    for (pm.calls) |pc| {
+        const st: state.CallState = if (std.mem.eql(u8, pc.state, "done")) .done else if (std.mem.eql(u8, pc.state, "rejected")) .rejected else if (std.mem.eql(u8, pc.state, "failed")) .failed else .pending; // running → pending (stream is gone)
+        m.calls.append(g, .{
+            .id = state.dupe(g, pc.id),
+            .name = state.dupe(g, pc.name),
+            .state = st,
+            .result = if (pc.result) |r| state.dupe(g, r) else null,
+        }) catch @panic("OOM");
+        const last = &m.calls.items[m.calls.items.len - 1];
+        last.args_json.appendSlice(g, pc.args_json) catch @panic("OOM");
+    }
+    return m;
+}
+
+/// Serialize convs+msgs+cfg subset to zllm-data/<token>.json.
+/// Throttled to once per 2s; deinit bypasses the throttle.
+fn persistSave(s: *Session) void {
+    const g = s.gpa;
+    const path = persistPath(s) orelse return;
+    defer g.free(path);
+    const now = Io.Clock.real.now(s.io).toMilliseconds();
+    if (now - s.deps.last_persist_ms < 2000) return;
+    s.deps.last_persist_ms = now;
+
+    var convs: std.ArrayListUnmanaged(PConv) = .empty;
+    defer {
+        for (convs.items) |c| {
+            for (c.msgs) |m| g.free(m.calls);
+            g.free(c.msgs);
+        }
+        g.free(convs.items);
+    }
+    for (s.deps.convs.items) |conv| {
+        var msgs: std.ArrayListUnmanaged(PMsg) = .empty;
+        for (conv.msgs.items) |m| msgs.append(g, msgToP(g, m)) catch @panic("OOM");
+        convs.append(g, .{ .title = conv.title, .msgs = msgs.items }) catch @panic("OOM");
+    }
+    const ps: PState = .{
+        .convs = convs.items,
+        .active = @intCast(@min(s.deps.active, std.math.maxInt(u32))),
+        .cfg = .{
+            .base_url = s.deps.cfg.base_url,
+            .model = s.deps.cfg.model,
+            .system = s.deps.cfg.system,
+            .temperature = s.deps.cfg.temperature,
+            .top_p = s.deps.cfg.top_p,
+            .context_window = s.deps.cfg.context_window,
+            .tool_mode = @tagName(s.deps.cfg.tool_mode),
+            .agent_mode = @tagName(s.deps.cfg.agent_mode),
+            .workspace = s.deps.cfg.workspace,
+            .tools_json = s.deps.cfg.tools_json,
+            .mcp_servers = s.deps.cfg.mcp_servers,
+        },
+    };
+    var aw: std.Io.Writer.Allocating = .init(g);
+    std.json.Stringify.value(ps, .{}, &aw.writer) catch return;
+    const data = aw.toOwnedSlice() catch return;
+    defer g.free(data);
+    const dir = std.fs.path.dirname(path) orelse "zllm-data";
+    std.Io.Dir.cwd().createDirPath(s.io, dir) catch {};
+    std.Io.Dir.cwd().writeFile(s.io, .{ .sub_path = path, .data = data }) catch {};
+}
+
+/// Load persisted state for this session's cookie token — replaces
+/// the default "Chat 1" conv. Runs once, lazily, on first request.
+fn persistLoad(s: *Session) void {
+    const g = s.gpa;
+    s.deps.persist_loaded = true;
+    const path = persistPath(s) orelse return;
+    defer g.free(path);
+    const data = std.Io.Dir.cwd().readFileAlloc(s.io, path, g, .limited(8 * 1024 * 1024)) catch return;
+    defer g.free(data);
+    const ps = std.json.parseFromSlice(PState, g, data, .{}) catch return;
+    defer ps.deinit();
+    if (ps.value.convs.len == 0) return;
+    // Free the default conv, rebuild from disk.
+    for (s.deps.convs.items) |c| state.convFree(g, c);
+    s.deps.convs.clearRetainingCapacity();
+    for (ps.value.convs, 0..) |pc, ci| {
+        const conv = state.convNew(g, pc.title);
+        for (pc.msgs) |pm| {
+            const m = pToMsg(g, pm);
+            state.convAppend(g, conv, m);
+        }
+        s.deps.convs.append(g, conv) catch @panic("OOM");
+        _ = ci;
+    }
+    s.deps.active = @min(@as(usize, ps.value.active), s.deps.convs.items.len - 1);
+    const c = ps.value.cfg;
+    state.setStr(g, &s.deps.cfg.base_url, c.base_url);
+    state.setStr(g, &s.deps.cfg.model, c.model);
+    state.setStr(g, &s.deps.cfg.system, c.system);
+    s.deps.cfg.temperature = c.temperature;
+    s.deps.cfg.top_p = c.top_p;
+    s.deps.cfg.context_window = c.context_window;
+    s.deps.cfg.tool_mode = if (std.mem.eql(u8, c.tool_mode, "auto")) .auto else if (std.mem.eql(u8, c.tool_mode, "off")) .off else .manual;
+    s.deps.cfg.agent_mode = if (std.mem.eql(u8, c.agent_mode, "code")) .code else .chat;
+    state.setStr(g, &s.deps.cfg.workspace, c.workspace);
+    state.setStr(g, &s.deps.cfg.tools_json, c.tools_json);
+    state.setStr(g, &s.deps.cfg.mcp_servers, c.mcp_servers);
+    // Re-parse tool defs from restored tools_json.
+    if (c.tools_json.len != 0) {
+        const defs = tools.parseDefs(g, c.tools_json) catch &.{};
+        tools.freeDefs(g, s.deps.tool_defs);
+        s.deps.tool_defs = defs;
+    }
+}
+
+/// `readCookies` hook — capture the session cookie token so state can
+/// persist per-browser across restarts.
+pub fn readCookies(s: *Session, cookie_hdr: ?[]const u8) void {
+    const hdr = cookie_hdr orelse return;
+    const prefix = LlmDeps.cookie_name ++ "=";
+    var it = std.mem.splitScalar(u8, hdr, ';');
+    while (it.next()) |part| {
+        const p = std.mem.trim(u8, part, " \t");
+        if (std.mem.startsWith(u8, p, prefix)) {
+            const tok = p[prefix.len..];
+            if (tok.len != 0 and tok.len <= 128) {
+                state.setStr(s.gpa, &s.deps.sess_token, tok);
+                if (!s.deps.persist_loaded) persistLoad(s);
+            }
+            return;
+        }
+    }
 }
 
 /// MCP tool call: async JSON-RPC tools/call on the MCP mailbox.

@@ -8,6 +8,7 @@
 //! eval()). User `exec:"mock"` tools return a canned `result`
 //! template (`{args}` → raw arguments JSON).
 const std = @import("std");
+const builtin = @import("builtin");
 const Io = std.Io;
 const state = @import("state.zig");
 
@@ -602,12 +603,18 @@ fn execBash(gpa: std.mem.Allocator, io: Io, obj: ?std.json.ObjectMap, workspace:
         if (t > 0 and t <= 120000) timeout_ms = @intFromFloat(t);
     }
     const argv = [_][]const u8{ "sh", "-c", cmd };
+    const em = scrubbedEnv(gpa);
+    defer if (em) |m| {
+        m.deinit();
+        gpa.destroy(m);
+    };
     var child = std.process.spawn(io, .{
         .argv = &argv,
         .stdin = .ignore,
         .stdout = .pipe,
         .stderr = .pipe,
         .cwd = if (workspace.len != 0) .{ .path = workspace } else .inherit,
+        .environ_map = em,
     }) catch return dupeStr(gpa, "error: spawn failed");
     defer child.kill(io); // idempotent — reaps if still running
 
@@ -670,6 +677,56 @@ fn execBash(gpa: std.mem.Allocator, io: Io, obj: ?std.json.ObjectMap, workspace:
     }
     if (result.items.len == 0) result.appendSlice(gpa, "(no output)") catch @panic("OOM");
     return result.toOwnedSlice(gpa) catch @panic("OOM");
+}
+
+/// Child environment with secrets stripped: vars whose NAME contains
+/// KEY/TOKEN/SECRET/PASSWORD/CREDENTIAL/AUTH (case-insensitive) are
+/// dropped unless allowlisted — keeps PATH/HOME/toolchain vars so
+/// builds still work. Caller owns the map (deinit + destroy).
+pub fn scrubbedEnv(gpa: std.mem.Allocator) ?*std.process.Environ.Map {
+    const map = gpa.create(std.process.Environ.Map) catch return null;
+    map.* = .init(gpa);
+    switch (builtin.os.tag) {
+        .windows, .wasi, .emscripten, .freestanding, .other => return map,
+        else => {},
+    }
+    const deny = [_][]const u8{ "KEY", "TOKEN", "SECRET", "PASSWORD", "CREDENTIAL", "AUTH" };
+    const allow = [_][]const u8{
+        "PATH",           "HOME",                    "LANG",    "LC_ALL", "LC_CTYPE",  "TMPDIR",  "TEMP",          "TMP",
+        "SHELL",          "USER",                    "LOGNAME", "TERM",   "COLORTERM", "SDKROOT", "DEVELOPER_DIR", "COMMAND_MODE",
+        "MallocNanoZone", "__CF_USER_TEXT_ENCODING",
+        "XPC_", "SSH_AUTH_SOCK", // agent socket is a path, not a secret
+    };
+    var i: usize = 0;
+    while (std.c.environ[i]) |entry| : (i += 1) {
+        const s = std.mem.span(entry);
+        const eq = std.mem.indexOfScalar(u8, s, '=') orelse continue;
+        const name = s[0..eq];
+        if (name.len == 0) continue;
+        var keep = false;
+        for (allow) |a| {
+            if (std.mem.startsWith(u8, name, a)) {
+                keep = true;
+                break;
+            }
+        }
+        if (!keep) {
+            var up_buf: [128]u8 = undefined;
+            keep = name.len > up_buf.len; // unreasonably long names pass through
+            if (!keep) {
+                const up = std.ascii.upperString(&up_buf, name);
+                keep = true;
+                for (deny) |d| {
+                    if (std.mem.indexOf(u8, up, d) != null) {
+                        keep = false;
+                        break;
+                    }
+                }
+            }
+        }
+        if (keep) map.put(name, s[eq + 1 ..]) catch {};
+    }
+    return map;
 }
 
 fn dupeStr(gpa: std.mem.Allocator, s: []const u8) []const u8 {
