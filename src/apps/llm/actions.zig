@@ -23,6 +23,8 @@ pub const actions = .{
     "fetch_models",
     "load_tools_example",
     "set_sysprompt",
+    "cfg_mcp_servers",
+    "mcp_check",
     "clear_key",
     "clear_chat",
 };

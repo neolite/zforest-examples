@@ -203,6 +203,21 @@ fn sideBar(a: std.mem.Allocator, s: *Session) forest.Node {
                 .on(.change, act.cfg_tools_json).node(),
             h.button(a).class("btn ghost").on(.click, act.load_tools_example).child("insert example").node(),
         }).node(),
+        h.section(a).class("card").children(.{
+            h.h2(a).child("MCP servers").node(),
+            h.p(a).class("hint").child("JSON array of {name,url,headers?} — Streamable HTTP transport. “check” runs initialize + tools/list; discovered tools join the request as mcp__<server>__<tool>.").node(),
+            h.textarea(a)
+                .id("cfg-mcp")
+                .class("mono")
+                .attr("rows", "4")
+                .value(s.deps.cfg.mcp_servers)
+                .child(s.deps.cfg.mcp_servers)
+                .on(.change, act.cfg_mcp_servers).node(),
+            h.div(a).class("mcp-bar").children(.{
+                h.button(a).class("btn ghost").on(.click, act.mcp_check).child("check connection").node(),
+                mcpStatus(a, s),
+            }).node(),
+        }).node(),
     }).node();
 }
 
@@ -280,6 +295,49 @@ fn endpointStatus(a: std.mem.Allocator, s: *Session) forest.Node {
         .class(h.f(a, "ep-status ep-{s}", .{kind}))
         .text(text)
         .node();
+}
+
+/// MCP health line — mirrors endpointStatus for the MCP card.
+fn mcpStatus(a: std.mem.Allocator, s: *Session) forest.Node {
+    const e = s.deps.mcp_status;
+    const kind: []const u8 = switch (e.kind) {
+        .idle => "idle",
+        .busy => "busy",
+        .ok => "ok",
+        .err => "err",
+    };
+    const text: []const u8 = switch (e.kind) {
+        .idle => "not checked yet",
+        .busy => h.f(a, "… {s}", .{e.text}),
+        .ok => h.f(a, "✓ {s}", .{e.text}),
+        .err => h.f(a, "✗ {s}", .{e.text}),
+    };
+    const ntools = mcpToolCount(s);
+    const tools_note: []const u8 = if (ntools != 0)
+        h.f(a, " · {d} mcp tool(s) loaded", .{ntools})
+    else
+        "";
+    return h.div(a)
+        .id("mcp-status")
+        .class(h.f(a, "ep-status ep-{s}", .{kind}))
+        .text(h.f(a, "{s}{s}", .{ text, tools_note }))
+        .node();
+}
+
+fn mcpToolCount(s: *Session) usize {
+    var n: usize = 0;
+    for (s.deps.mcp_tools.items) |mt| {
+        // tools_json is "[…]" — count top-level objects cheaply by
+        // counting '"name"' keys at function level is fragile; the
+        // array was built by us so count occurrences of
+        // `"type":"function"`.
+        // splitSequence yields k+1 segments for k occurrences — the
+        // first is the preamble, so skip it before counting.
+        var it = std.mem.splitSequence(u8, mt.tools_json, "\"type\":\"function\"");
+        _ = it.next();
+        while (it.next()) |_| n += 1;
+    }
+    return n;
 }
 
 /// Model picker: `variant` swaps between a text input (no /models
@@ -374,26 +432,70 @@ fn centerCol(a: std.mem.Allocator, s: *Session) forest.Node {
     }).node();
 }
 
+/// Context meter: stacked SVG segments (one per source — system,
+/// tools, user/assistant/tool messages). `style` isn't in client.js's
+/// attr whitelist, so widths ride on SVG `x`/`width` attrs — integer
+/// permille of a 1000-wide viewBox. Denominator is min(total, window):
+/// under the window the stack fills the bar showing composition; over
+/// it the stack overflows past 1000 and clips at full.
 fn ctxBar(a: std.mem.Allocator, s: *Session) forest.Node {
-    const est = estCtx(s);
+    const conv = app.curConv(s);
+    const parts = state.estTokensParts(conv.msgs.items, s.deps.cfg.system.len, s.deps.cfg.tools_json.len);
+    const total = parts.total();
     const win = s.deps.cfg.context_window;
-    const pct = if (win == 0) @as(u64, 0) else @min(@as(u64, 100), est * 100 / @max(win, 1));
+    const den = @min(total, @as(u64, win));
+    const pct = if (win == 0) @as(u64, 0) else @min(@as(u64, 100), total * 100 / @max(win, 1));
+
+    const Seg = struct { name: []const u8, label: []const u8, n: u64 };
+    const segs = [_]Seg{
+        .{ .name = "sys", .label = "system", .n = parts.system },
+        .{ .name = "tools", .label = "tools", .n = parts.tools },
+        .{ .name = "user", .label = "you", .n = parts.user },
+        .{ .name = "ai", .label = "assistant", .n = parts.assistant },
+        .{ .name = "tool", .label = "tool", .n = parts.tool },
+    };
+
+    var rects: std.ArrayListUnmanaged(forest.Node) = .empty;
+    var legend: std.ArrayListUnmanaged(forest.Node) = .empty;
+    var x: u64 = 0;
+    for (segs) |sg| {
+        const w = if (den == 0) @as(u64, 0) else sg.n * 1000 / den;
+        const x0 = x;
+        x += w;
+        rects.append(a, h.rect(a)
+            .id(h.f(a, "ctx-seg-{s}", .{sg.name}))
+            .class(h.f(a, "ctx-seg ctx-{s}", .{sg.name}))
+            .attr("x", h.f(a, "{d}", .{x0}))
+            .attr("width", h.f(a, "{d}", .{w}))
+            .attr("height", "10")
+            .attr("y", "0")
+            .attr("title", h.f(a, "{s}: ~{d} est tok", .{ sg.label, sg.n }))
+            .node()) catch @panic("OOM");
+        legend.append(a, h.span(a).class("ctx-lg").children(.{
+            h.span(a).class(h.f(a, "ctx-dot ctx-{s}", .{sg.name})).node(),
+            h.span(a)
+                .id(h.f(a, "ctx-lg-{s}", .{sg.name}))
+                .text(h.f(a, "{s} {d}", .{ sg.label, sg.n }))
+                .node(),
+        }).node()) catch @panic("OOM");
+    }
+
     return h.div(a).class("ctxbar").children(.{
         h.div(a).class("ctxbar-top").children(.{
             h.span(a).class("ctxbar-label").child("context").node(),
             h.span(a)
                 .id("ctxbar-num")
                 .class("ctxbar-num")
-                .text(h.f(a, "~{d} est / {d} window ({d}%)", .{ est, win, pct }))
+                .text(h.f(a, "~{d} est / {d} window ({d}%)", .{ total, win, pct }))
                 .node(),
         }).node(),
-        h.div(a).class("ctxbar-track").children(.{
-            h.div(a)
-                .id("ctxbar-fill")
-                .class("ctxbar-fill")
-                .attr("style", h.f(a, "width:{d}%", .{pct}))
-                .node(),
-        }).node(),
+        h.svg(a)
+            .class("ctxbar-svg")
+            .attr("viewBox", "0 0 1000 10")
+            .attr("preserveAspectRatio", "none")
+            .children(rects.items)
+            .node(),
+        h.div(a).class("ctx-legend").children(legend.items).node(),
     }).node();
 }
 
@@ -625,8 +727,16 @@ fn usageBox(a: std.mem.Allocator, s: *Session) forest.Node {
 /// log, so they mount collapsed; req/err/sys/tool stay expanded.
 fn inspRows(a: std.mem.Allocator, s: *Session) forest.Children {
     const items = s.deps.inspector.items;
-    const start = if (items.len > 80) items.len - 80 else 0;
-    return h.eachOf(a, items[start..], s, inspRow);
+    // Per-chat inspector: entries tagged with a conversation show only
+    // under that chat; chat == 0 entries are global (config, presets,
+    // models, mcp checks) and visible everywhere.
+    const cur = @intFromPtr(app.curConv(s));
+    var filt: std.ArrayListUnmanaged(app.InspectorEntry) = .empty;
+    for (items) |e| {
+        if (e.chat == 0 or e.chat == cur) filt.append(a, e) catch @panic("OOM");
+    }
+    const start = if (filt.items.len > 80) filt.items.len - 80 else 0;
+    return h.eachOf(a, filt.items[start..], s, inspRow);
 }
 
 fn inspRow(a: std.mem.Allocator, s: *Session, e: app.InspectorEntry) ?forest.Node {

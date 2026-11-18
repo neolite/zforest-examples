@@ -62,6 +62,19 @@ pub fn main(init: std.process.Init) !void {
     if (endpoint) |ep| {
         if (ep.len != 0) llm.setEnvEndpoint(ep);
     }
+    // MCP servers: ZLLM_MCP_JSON env wins, else mcp.json next to the
+    // app (.env-style lookup: src/apps/llm/mcp.json, then ./mcp.json).
+    const mcp_json = init.environ_map.get("ZLLM_MCP_JSON") orelse blk: {
+        const paths = [_][]const u8{ "src/apps/llm/mcp.json", "mcp.json" };
+        for (paths) |path| {
+            const data = std.Io.Dir.cwd().readFileAlloc(init.io, path, init.gpa, .limited(64 * 1024)) catch continue;
+            break :blk data;
+        }
+        break :blk null;
+    };
+    if (mcp_json) |mj| {
+        if (mj.len != 0) llm.setEnvMcpServers(mj);
+    }
 
     try server.serve(init.gpa, init.io, bind, llm.Session);
 }
@@ -71,5 +84,6 @@ test {
     _ = @import("state.zig");
     _ = @import("tools.zig");
     _ = @import("openai.zig");
+    _ = @import("mcp.zig");
     _ = @import("presets.zig");
 }

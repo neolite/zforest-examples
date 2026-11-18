@@ -82,6 +82,8 @@ pub const Config = struct {
     tool_mode: ToolMode = .manual,
     /// Raw JSON array of user tool defs (validated on set).
     tools_json: []const u8 = "",
+    /// Raw JSON array of MCP server configs (validated on set).
+    mcp_servers: []const u8 = "",
 };
 
 pub const Conversation = struct {
@@ -120,9 +122,25 @@ pub const Ev = union(enum) {
     req: []const u8,
     /// Fetched /models id list — the session ADOPTS the slice.
     models: [][]const u8,
+    /// MCP check result for one server (all strings owned).
+    mcp: struct {
+        server: []const u8,
+        ok: bool,
+        detail: []const u8,
+        /// OpenAI tools array text ("[]" on failure).
+        tools_json: []const u8,
+    },
+    /// MCP tools/call result routed back to a ToolCall by position.
+    mcp_call: struct {
+        conv: u32,
+        msg: u32,
+        call: u32,
+        ok: bool,
+        text: []const u8,
+    },
 };
 
-pub const JobKind = enum { chat, models };
+pub const JobKind = enum { chat, models, mcp_check, mcp_call };
 
 /// What the worker needs, snapshotted at dispatch time. Owned by the
 /// Mailbox (freed in deinit) so the worker never reads session memory.
@@ -131,8 +149,15 @@ pub const Job = struct {
     /// Full URL (…/chat/completions or …/models).
     url: []const u8 = "",
     api_key: []const u8 = "",
-    /// Request body (chat) — empty for models.
+    /// Request body (chat) — for mcp_check the servers config JSON,
+    /// for mcp_call the tools/call `params` object.
     body: []const u8 = "",
+    /// mcp_call only: JSON object of extra headers (custom auth etc).
+    extra: []const u8 = "",
+    /// mcp_call only: conv/msg/call indices echoed into .mcp_call.
+    pos_conv: u32 = 0,
+    pos_msg: u32 = 0,
+    pos_call: u32 = 0,
 };
 
 /// Shared worker↔session channel. refs = session(1) + worker(1);
@@ -207,6 +232,7 @@ pub const Mailbox = struct {
         if (self.job.url.len != 0) self.gpa.free(self.job.url);
         if (self.job.api_key.len != 0) self.gpa.free(self.job.api_key);
         if (self.job.body.len != 0) self.gpa.free(self.job.body);
+        if (self.job.extra.len != 0) self.gpa.free(self.job.extra);
         // `msg` is session-owned — never freed here.
     }
 };
@@ -228,6 +254,12 @@ pub fn freeEv(gpa: std.mem.Allocator, ev: Ev) void {
             for (ids) |id| gpa.free(id);
             gpa.free(ids);
         },
+        .mcp => |r| {
+            gpa.free(r.server);
+            gpa.free(r.detail);
+            gpa.free(r.tools_json);
+        },
+        .mcp_call => |r| gpa.free(r.text),
     }
 }
 
@@ -427,6 +459,35 @@ pub fn estTokens(msgs: []const *Msg, system_len: usize) u64 {
         for (m.calls.items) |c| n += @intCast(c.args_json.items.len / 4);
     }
     return n;
+}
+
+/// Context composition for the segmented meter — same chars/4
+/// heuristic split by source: system prompt, tools payload, and
+/// messages grouped by role.
+pub const CtxParts = struct {
+    system: u64 = 0,
+    tools: u64 = 0,
+    user: u64 = 0,
+    assistant: u64 = 0,
+    tool: u64 = 0,
+
+    pub fn total(self: CtxParts) u64 {
+        return self.system + self.tools + self.user + self.assistant + self.tool;
+    }
+};
+
+pub fn estTokensParts(msgs: []const *Msg, system_len: usize, tools_len: usize) CtxParts {
+    var p: CtxParts = .{ .system = system_len / 4, .tools = tools_len / 4 };
+    for (msgs) |m| {
+        var n = @as(u64, m.text.items.len / 4) + @as(u64, m.reasoning.items.len / 4);
+        for (m.calls.items) |c| n += @intCast(c.args_json.items.len / 4);
+        switch (m.role) {
+            .user => p.user += n,
+            .assistant => p.assistant += n,
+            .tool => p.tool += n,
+        }
+    }
+    return p;
 }
 
 // ── tests ────────────────────────────────────────────────────────

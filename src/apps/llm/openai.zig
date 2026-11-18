@@ -10,6 +10,7 @@
 const std = @import("std");
 const Io = std.Io;
 const state = @import("state.zig");
+const mcp = @import("mcp.zig");
 
 // ── chunk JSON shape ─────────────────────────────────────────────
 
@@ -208,6 +209,17 @@ pub fn worker(mb: *state.Mailbox) void {
     defer mb.workerDone();
     const gpa = mb.gpa;
     const job = &mb.job;
+
+    // MCP jobs have their own JSON-RPC transport — same Mailbox,
+    // different wire protocol.
+    if (job.kind == .mcp_check) {
+        mcp.checkWorker(mb);
+        return;
+    }
+    if (job.kind == .mcp_call) {
+        mcp.callWorker(mb);
+        return;
+    }
 
     var client: std.http.Client = .{ .allocator = gpa, .io = mb.io };
     defer client.deinit();

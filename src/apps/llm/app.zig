@@ -15,6 +15,7 @@ const actions = @import("gen/actions.zig");
 const state = @import("state.zig");
 const tools = @import("tools.zig");
 const openai = @import("openai.zig");
+const mcp = @import("mcp.zig");
 const presets = @import("presets.zig");
 
 /// Console stylesheet — inlined into <head> by pages/index.zig `head`
@@ -28,10 +29,16 @@ const Ping = struct {};
 /// out of the box. Never rendered back into HTML.
 var env_api_key: []const u8 = "";
 var env_base_url: []const u8 = "";
+var env_mcp_servers: []const u8 = "";
 
 /// `ZLLM_API_ENDPOINT` (or .env) seeds every session's base_url.
 pub fn setEnvEndpoint(url: []const u8) void {
     env_base_url = url;
+}
+
+/// `ZLLM_MCP_JSON` env or mcp.json seeds every session's MCP config.
+pub fn setEnvMcpServers(json: []const u8) void {
+    env_mcp_servers = json;
 }
 
 pub fn setEnvApiKey(key: []const u8) void {
@@ -49,14 +56,25 @@ pub const InspectorEntry = struct {
     /// Stable identity for the keyed inspector list (never reused,
     /// survives ring-cap eviction of older entries).
     seq: u64,
-    kind: []const u8, // "req" | "sse" | "tool" | "sys" | "err"
+    kind: []const u8, // "req" | "sse" | "tool" | "sys" | "err" | "mcp"
     text: []const u8,
+    /// Owning conversation pointer — the inspector filters by the
+    /// active chat. 0 = global entry, shown under every chat.
+    chat: usize = 0,
 };
 
 pub const EndpointState = enum { idle, busy, ok, err };
 pub const EndpointStatus = struct {
     kind: EndpointState = .idle,
     text: []const u8 = "",
+};
+
+/// Tools discovered via MCP `tools/list` — kept per server so a
+/// re-check replaces only that server's slice. `tools_json` is an
+/// OpenAI `tools` array text ("[]" when the check failed).
+pub const McpTool = struct {
+    server: []const u8,
+    tools_json: []const u8,
 };
 
 pub const LlmDeps = struct {
@@ -89,6 +107,13 @@ pub const LlmDeps = struct {
     /// Last endpoint operation result — the visible "did it connect"
     /// signal in the Endpoint card.
     endpoint: EndpointStatus = .{},
+    /// MCP servers that passed `tools/list` (discovered tools).
+    mcp_tools: std.ArrayListUnmanaged(McpTool) = .empty,
+    /// Last MCP check/call outcome — the MCP card status line.
+    mcp_status: EndpointStatus = .{},
+    /// In-flight MCP worker (check or tools/call) — separate from
+    /// `mailbox` so a chat stream and an MCP call can overlap.
+    mcp_mb: ?*state.Mailbox = null,
 
     ping: *zefx.Event(Ping),
 
@@ -105,6 +130,9 @@ pub const LlmDeps = struct {
             .send_queue = .empty,
             .tool_turns = 0,
             .key_from_env = false,
+            .mcp_tools = .empty,
+            .mcp_status = .{},
+            .mcp_mb = null,
             .ping = s.app.createEvent(Ping),
         };
         // gpa-own every default so deinit can free uniformly.
@@ -122,6 +150,9 @@ pub const LlmDeps = struct {
         if (env_base_url.len != 0) {
             d.cfg.base_url = state.dupe(g, env_base_url);
         }
+        if (env_mcp_servers.len != 0) {
+            d.cfg.mcp_servers = state.dupe(g, env_mcp_servers);
+        }
         d.convs.append(g, state.convNew(g, "Chat 1")) catch @panic("OOM");
         return d;
     }
@@ -130,6 +161,14 @@ pub const LlmDeps = struct {
         const g = s.gpa;
         if (s.deps.mailbox) |mb| mb.close();
         s.deps.mailbox = null;
+        if (s.deps.mcp_mb) |mb| mb.close();
+        s.deps.mcp_mb = null;
+        for (s.deps.mcp_tools.items) |mt| {
+            state.freeStr(g, mt.server);
+            state.freeStr(g, mt.tools_json);
+        }
+        s.deps.mcp_tools.deinit(g);
+        state.freeStr(g, s.deps.mcp_status.text);
         for (s.deps.convs.items) |c| state.convFree(g, c);
         s.deps.convs.deinit(g);
         inline for (@typeInfo(state.Config).@"struct".field_names) |fname| {
@@ -172,25 +211,11 @@ pub const LlmDeps = struct {
 
     /// SSE-worker hook: drain mailbox events into the session model,
     /// then ping once if anything applied (one flush per poll tick).
+    /// Two mailboxes drain independently: `mailbox` (chat/models) and
+    /// `mcp_mb` (MCP check/call workers).
     pub fn syncPull(s: *Session) void {
-        const mb = s.deps.mailbox orelse return;
-        var evs: std.ArrayListUnmanaged(state.Ev) = .empty;
-        mb.drain(&evs);
-        defer {
-            for (evs.items) |ev| state.freeEv(s.gpa, ev);
-            evs.deinit(s.gpa);
-        }
-        if (evs.items.len == 0) {
-            // Mailbox may have finished between polls — finalize.
-            if (mb.finished.load(.seq_cst)) finishStream(s, mb);
-            return;
-        }
-        var changed = false;
-        for (evs.items) |ev| {
-            changed = applyEv(s, mb, ev) or changed;
-        }
-        if (changed) s.deps.ping.emit(.{});
-        if (mb.finished.load(.seq_cst)) finishStream(s, mb);
+        if (s.deps.mailbox) |mb| drainMailbox(s, mb, true);
+        if (s.deps.mcp_mb) |mb| drainMailbox(s, mb, false);
     }
     // ── actions ──────────────────────────────────────────────────────
 
@@ -203,7 +228,7 @@ pub const LlmDeps = struct {
         try doSend(s, text);
     }
 
-    /// `stop` — cancel the active stream.
+    /// `stop` — cancel the active stream(s).
     pub fn on_stop(s: *Session, arg: ?[]const u8, value: ?[]const u8, fields: ?*const std.json.ObjectMap) !void {
         _ = arg;
         _ = value;
@@ -212,6 +237,7 @@ pub const LlmDeps = struct {
             mb.cancel.store(true, .seq_cst);
             note(s, "sys", "stop requested");
         }
+        if (s.deps.mcp_mb) |mb| mb.cancel.store(true, .seq_cst);
         s.deps.ping.emit(.{});
     }
 
@@ -402,6 +428,56 @@ pub const LlmDeps = struct {
         s.deps.ping.emit(.{});
     }
 
+    /// `cfg_mcp_servers` — textarea commit; validated BEFORE storing
+    /// (same contract as tools_json). A config change invalidates
+    /// previously discovered tools.
+    pub fn on_cfg_mcp_servers(s: *Session, arg: ?[]const u8, value: ?[]const u8, fields: ?*const std.json.ObjectMap) !void {
+        _ = arg;
+        _ = fields;
+        const v = value orelse return error.InvalidAction;
+        const servers = mcp.parseConfig(s.gpa, v) catch |e| {
+            noteFmt(s, "err", "mcp_servers rejected: {s}", .{@errorName(e)});
+            s.deps.ping.emit(.{});
+            return;
+        };
+        mcp.freeServers(s.gpa, servers);
+        state.setStr(s.gpa, &s.deps.cfg.mcp_servers, v);
+        // Stale discoveries no longer match the config — drop them.
+        for (s.deps.mcp_tools.items) |mt| {
+            state.freeStr(s.gpa, mt.server);
+            state.freeStr(s.gpa, mt.tools_json);
+        }
+        s.deps.mcp_tools.clearRetainingCapacity();
+        noteFmt(s, "sys", "mcp_servers: {d} server(s) configured", .{servers.len});
+        s.deps.ping.emit(.{});
+    }
+
+    /// `mcp_check` — run initialize + tools/list against every
+    /// configured server on the MCP worker mailbox.
+    pub fn on_mcp_check(s: *Session, arg: ?[]const u8, value: ?[]const u8, fields: ?*const std.json.ObjectMap) !void {
+        _ = arg;
+        _ = value;
+        _ = fields;
+        if (std.mem.trim(u8, s.deps.cfg.mcp_servers, " \t\r\n").len == 0) return error.ConfigRequired;
+        if (s.deps.mailbox != null or s.deps.mcp_mb != null) return error.Busy;
+        const body = state.dupe(s.gpa, s.deps.cfg.mcp_servers);
+        const mb = state.Mailbox.create(s.gpa, s.io, .{
+            .kind = .mcp_check,
+            .body = body,
+        }, null);
+        if (!spawnWorker(mb)) {
+            s.gpa.free(body);
+            mb.deinit();
+            s.gpa.destroy(mb);
+            return error.SpawnFailed;
+        }
+        s.deps.mcp_mb = mb;
+        s.deps.mcp_status.kind = .busy;
+        state.setStr(s.gpa, &s.deps.mcp_status.text, "checking servers…");
+        note(s, "sys", "mcp: checking servers…");
+        s.deps.ping.emit(.{});
+    }
+
     /// `clear_key` — wipe the api key.
     pub fn on_clear_key(s: *Session, arg: ?[]const u8, value: ?[]const u8, fields: ?*const std.json.ObjectMap) !void {
         _ = arg;
@@ -455,26 +531,35 @@ pub fn curConv(s: *Session) *state.Conversation {
 }
 
 /// Append an inspector entry (bounded ring — oldest drops).
-fn note(s: *Session, comptime kind: []const u8, text: []const u8) void {
+/// `chat` = conversation pointer or 0 for global.
+fn noteIn(s: *Session, comptime kind: []const u8, text: []const u8, chat: usize) void {
     const g = s.gpa;
     if (s.deps.inspector.items.len >= inspector_cap) {
         const old = s.deps.inspector.orderedRemove(0);
         g.free(old.text);
     }
     s.deps.insp_seq += 1;
-    s.deps.inspector.append(g, .{ .seq = s.deps.insp_seq, .kind = kind, .text = state.dupe(g, text) }) catch @panic("OOM");
+    s.deps.inspector.append(g, .{ .seq = s.deps.insp_seq, .kind = kind, .text = state.dupe(g, text), .chat = chat }) catch @panic("OOM");
 }
 
-fn noteOwned(s: *Session, comptime kind: []const u8, text: []const u8) void {
+fn note(s: *Session, comptime kind: []const u8, text: []const u8) void {
+    noteIn(s, kind, text, @intFromPtr(curConv(s)));
+}
+
+fn noteOwnedIn(s: *Session, comptime kind: []const u8, text: []const u8, chat: usize) void {
     // text already gpa-owned — adopt it (inspector frees later).
     if (s.deps.inspector.items.len >= inspector_cap) {
         const old = s.deps.inspector.orderedRemove(0);
         s.gpa.free(old.text);
     }
     s.deps.insp_seq += 1;
-    s.deps.inspector.append(s.gpa, .{ .seq = s.deps.insp_seq, .kind = kind, .text = text }) catch {
+    s.deps.inspector.append(s.gpa, .{ .seq = s.deps.insp_seq, .kind = kind, .text = text, .chat = chat }) catch {
         s.gpa.free(text);
     };
+}
+
+fn noteOwned(s: *Session, comptime kind: []const u8, text: []const u8) void {
+    noteOwnedIn(s, kind, text, @intFromPtr(curConv(s)));
 }
 
 /// noteFmt — allocPrint then adopt (no double-alloc leak).
@@ -486,9 +571,42 @@ fn endpointFmt(s: *Session, kind: EndpointState, comptime fmt: []const u8, args:
     state.setStr(s.gpa, &s.deps.endpoint.text, t);
 }
 
-fn noteFmt(s: *Session, comptime kind: []const u8, comptime fmt: []const u8, args: anytype) void {
+fn noteFmtIn(s: *Session, comptime kind: []const u8, comptime fmt: []const u8, args: anytype, chat: usize) void {
     const t = std.fmt.allocPrint(s.gpa, fmt, args) catch return;
-    noteOwned(s, kind, t);
+    noteOwnedIn(s, kind, t, chat);
+}
+
+fn noteFmt(s: *Session, comptime kind: []const u8, comptime fmt: []const u8, args: anytype) void {
+    noteFmtIn(s, kind, fmt, args, @intFromPtr(curConv(s)));
+}
+
+/// Conversation pointer owning a message (for inspector chat tags).
+fn convOfMsg(s: *Session, m: ?*state.Msg) usize {
+    const mm = m orelse return 0;
+    for (s.deps.convs.items) |c| {
+        for (c.msgs.items) |x| {
+            if (x == mm) return @intFromPtr(c);
+        }
+    }
+    return 0;
+}
+
+/// Coalesce a payload onto the LAST inspector entry when kind+chat
+/// match — SSE chunks would otherwise flood the ring (one entry per
+/// delta) and evict the req/tool rows users actually look for.
+fn noteAppend(s: *Session, comptime kind: []const u8, text: []const u8, chat: usize) bool {
+    const list = &s.deps.inspector;
+    if (list.items.len == 0) return false;
+    const last = &list.items[list.items.len - 1];
+    if (last.chat != chat or !std.mem.eql(u8, last.kind, kind)) return false;
+    // Cap the merged blob — past this, start a fresh entry instead of
+    // paying O(n²) realloc on every delta.
+    if (last.text.len > 128 * 1024) return false;
+    const g = s.gpa;
+    const nt = std.fmt.allocPrint(g, "{s}\n{s}", .{ last.text, text }) catch return false;
+    g.free(last.text);
+    last.text = nt;
+    return true;
 }
 
 fn fieldStr(f: *const std.json.ObjectMap, name: []const u8) ?[]const u8 {
@@ -501,12 +619,74 @@ fn fieldStr(f: *const std.json.ObjectMap, name: []const u8) ?[]const u8 {
 
 // ── stream lifecycle ─────────────────────────────────────────────
 
-/// Build the tools payload for a request: user defs → OpenAI tools
-/// array. "" when tools are off or none defined. gpa-owned result —
-/// caller frees.
+/// Drain one mailbox's pending events into session state. `is_chat`
+/// selects the finalize path: chat/models mailboxes run finishStream
+/// (tool loop + send queue); the MCP mailbox just closes out.
+fn drainMailbox(s: *Session, mb: *state.Mailbox, is_chat: bool) void {
+    var evs: std.ArrayListUnmanaged(state.Ev) = .empty;
+    mb.drain(&evs);
+    defer {
+        for (evs.items) |ev| state.freeEv(s.gpa, ev);
+        evs.deinit(s.gpa);
+    }
+    if (evs.items.len == 0) {
+        if (mb.finished.load(.seq_cst)) finalizeMailbox(s, mb, is_chat);
+        return;
+    }
+    var changed = false;
+    for (evs.items) |ev| {
+        changed = applyEv(s, mb, ev) or changed;
+    }
+    if (changed) s.deps.ping.emit(.{});
+    if (mb.finished.load(.seq_cst)) finalizeMailbox(s, mb, is_chat);
+}
+
+fn finalizeMailbox(s: *Session, mb: *state.Mailbox, is_chat: bool) void {
+    if (is_chat) {
+        finishStream(s, mb);
+    } else {
+        s.deps.mcp_mb = null;
+        mb.close();
+    }
+}
+
+/// Build the tools payload for a request: user defs + discovered MCP
+/// tools merged into one OpenAI `tools` array. "" when tools are off
+/// or none defined. gpa-owned result — caller frees.
 fn toolsPayload(s: *Session) []const u8 {
-    if (s.deps.cfg.tool_mode == .off or s.deps.tool_defs.len == 0) return "";
-    return tools.defsToToolsJson(s.gpa, s.deps.tool_defs);
+    if (s.deps.cfg.tool_mode == .off) return "";
+    var aw: std.Io.Writer.Allocating = .init(s.gpa);
+    const w = &aw.writer;
+    w.writeByte('[') catch @panic("OOM");
+    var n: usize = 0;
+    // Splice the inner objects of each `[…]` array — both producers
+    // (defsToToolsJson, mcp toolsToOpenAi) emit compact arrays, so
+    // stripping the outer brackets and comma-joining is exact.
+    const emitInner = struct {
+        fn f(wr: anytype, json: []const u8, count: *usize) void {
+            const t = std.mem.trim(u8, json, " \t\r\n");
+            if (t.len < 2 or t[0] != '[' or t[t.len - 1] != ']') return;
+            const inner = std.mem.trim(u8, t[1 .. t.len - 1], " \t\r\n");
+            if (inner.len == 0) return;
+            if (count.* != 0) wr.writeByte(',') catch @panic("OOM");
+            wr.writeAll(inner) catch @panic("OOM");
+            count.* += 1;
+        }
+    }.f;
+    if (s.deps.tool_defs.len != 0) {
+        const uj = tools.defsToToolsJson(s.gpa, s.deps.tool_defs);
+        defer s.gpa.free(uj);
+        emitInner(w, uj, &n);
+    }
+    for (s.deps.mcp_tools.items) |mt| {
+        emitInner(w, mt.tools_json, &n);
+    }
+    w.writeByte(']') catch @panic("OOM");
+    if (n == 0) {
+        aw.deinit();
+        return "";
+    }
+    return aw.toOwnedSlice() catch @panic("OOM");
 }
 
 /// Reaper context: the Group must be awaited before it can be freed,
@@ -728,7 +908,6 @@ fn resolveAllCalls(s: *Session, am: *state.Msg) void {
 /// store the result.
 fn resolveCall(s: *Session, am: *state.Msg, c: *state.ToolCall) void {
     const g = s.gpa;
-    _ = am;
     c.state = .running;
     // Find def by wire name.
     var def: ?tools.ToolDef = null;
@@ -742,14 +921,114 @@ fn resolveCall(s: *Session, am: *state.Msg, c: *state.ToolCall) void {
         const res = tools.exec(g, s.io, &d, c.args_json.items);
         c.result = res;
         c.state = .done;
-        noteFmt(s, "tool", "{s}({s}) → {s}", .{ c.name, c.args_json.items, res });
+        noteFmtIn(s, "tool", "{s}({s}) → {s}", .{ c.name, c.args_json.items, res }, convOfMsg(s, am));
+    } else if (mcp.parseWireName(c.name)) |mt| {
+        resolveCallMcp(s, am, c, mt.server, mt.tool);
     } else {
         // Not a declared tool — answer like a real API would: error
         // result so the model can recover.
         c.result = std.fmt.allocPrint(g, "error: unknown tool '{s}'", .{c.name}) catch @panic("OOM");
         c.state = .failed;
-        noteFmt(s, "tool", "{s}: unknown tool", .{c.name});
+        noteFmtIn(s, "tool", "{s}: unknown tool", .{c.name}, convOfMsg(s, am));
     }
+}
+
+/// MCP tool call: async JSON-RPC tools/call on the MCP mailbox.
+/// The call stays `.running` until the `.mcp_call` event lands —
+/// maybeContinue fires the follow-up request once ALL calls resolve.
+fn resolveCallMcp(s: *Session, am: *state.Msg, c: *state.ToolCall, server_name: []const u8, tool_name: []const u8) void {
+    const g = s.gpa;
+    c.state = .running;
+    const fail = struct {
+        fn f(sess: *Session, tc: *state.ToolCall, msg: []const u8) void {
+            if (tc.result) |old| state.freeStr(sess.gpa, old);
+            tc.result = state.dupe(sess.gpa, msg);
+            tc.state = .failed;
+        }
+    }.f;
+    // Locate conv/msg/call positions for result routing.
+    var conv_i: ?usize = null;
+    var msg_i: ?usize = null;
+    for (s.deps.convs.items, 0..) |conv, i| {
+        for (conv.msgs.items, 0..) |m, j| {
+            if (m == am) {
+                conv_i = i;
+                msg_i = j;
+                break;
+            }
+        }
+        if (conv_i != null) break;
+    }
+    const ci = conv_i orelse {
+        fail(s, c, "error: mcp call lost (conversation not found)");
+        return;
+    };
+    const mi = msg_i.?;
+    const ki: usize = @intCast(c - am.calls.items.ptr);
+    if (ki >= am.calls.items.len) {
+        fail(s, c, "error: mcp call lost (call slot invalid)");
+        return;
+    }
+    if (s.deps.mcp_mb != null) {
+        fail(s, c, "error: another mcp call is in flight");
+        return;
+    }
+    const servers = mcp.parseConfig(g, s.deps.cfg.mcp_servers) catch {
+        fail(s, c, "error: mcp config invalid");
+        return;
+    };
+    defer mcp.freeServers(g, servers);
+    var srv: ?mcp.Server = null;
+    for (servers) |sv| {
+        if (std.mem.eql(u8, sv.name, server_name)) {
+            srv = sv;
+            break;
+        }
+    }
+    const sv = srv orelse {
+        fail(s, c, "error: unknown mcp server");
+        return;
+    };
+    // params = {"name":<tool>,"arguments":<args|{}>} — args must be a
+    // JSON object; malformed model output degrades to {}.
+    const args_raw = std.mem.trim(u8, c.args_json.items, " \t\r\n");
+    var args_ok = false;
+    if (args_raw.len != 0) {
+        var ap = std.json.parseFromSlice(std.json.Value, g, args_raw, .{}) catch null;
+        defer if (ap) |*p| p.deinit();
+        args_ok = ap != null and ap.?.value == .object;
+    }
+    var aw: std.Io.Writer.Allocating = .init(g);
+    const w = &aw.writer;
+    w.writeAll("{\"name\":") catch @panic("OOM");
+    state.jsonStrPub(w, tool_name) catch @panic("OOM");
+    w.writeAll(",\"arguments\":") catch @panic("OOM");
+    if (args_ok) {
+        w.writeAll(args_raw) catch @panic("OOM");
+    } else {
+        w.writeAll("{}") catch @panic("OOM");
+    }
+    w.writeByte('}') catch @panic("OOM");
+    const params = aw.toOwnedSlice() catch @panic("OOM");
+    const hdrs = mcp.headersJsonFor(g, sv.headers);
+    const mb = state.Mailbox.create(g, s.io, .{
+        .kind = .mcp_call,
+        .url = state.dupe(g, sv.url),
+        .body = params,
+        .extra = hdrs,
+        .pos_conv = @intCast(ci),
+        .pos_msg = @intCast(mi),
+        .pos_call = @intCast(ki),
+    }, null);
+    if (!spawnWorker(mb)) {
+        // mb.deinit frees the job's owned url/body/extra.
+        mb.deinit();
+        g.destroy(mb);
+        fail(s, c, "error: failed to start mcp worker");
+        return;
+    }
+    s.deps.mcp_mb = mb;
+    noteFmtIn(s, "mcp", "{s}/{s} → calling", .{ server_name, tool_name }, convOfMsg(s, am));
 }
 
 /// approve/reject by position — arg = "{msg_index}:{call_index}".
@@ -770,7 +1049,7 @@ fn resolveCallByPos(s: *Session, arg: []const u8, approve: bool) !void {
     } else {
         c.state = .rejected;
         c.result = state.dupe(g, "tool call rejected by user");
-        noteFmt(s, "tool", "{s}: rejected", .{c.name});
+        noteFmtIn(s, "tool", "{s}: rejected", .{c.name}, @intFromPtr(curConv(s)));
     }
     // All resolved? → continue the conversation.
     var pending = false;
@@ -787,15 +1066,72 @@ fn resolveCallByPos(s: *Session, arg: []const u8, approve: bool) !void {
 /// view should re-render.
 fn applyEv(s: *Session, mb: *state.Mailbox, ev: state.Ev) bool {
     const g = s.gpa;
+    // MCP jobs relabel wire logs as "mcp" in the inspector.
+    const is_mcp_job = mb.job.kind == .mcp_check or mb.job.kind == .mcp_call;
     // Session-level events first — they apply with or without a
     // target message (models fetch has msg == null).
     switch (ev) {
         .raw => |r| {
-            note(s, "sse", r);
+            if (is_mcp_job) {
+                noteIn(s, "mcp", r, 0);
+            } else {
+                // Chat SSE payloads coalesce into one growing entry —
+                // one row per delta would flood the inspector ring.
+                const chat = convOfMsg(s, mb.msg);
+                if (!noteAppend(s, "sse", r, chat)) noteIn(s, "sse", r, chat);
+            }
             return true;
         },
         .req => |r| {
-            note(s, "req", r);
+            if (is_mcp_job) {
+                noteIn(s, "mcp", r, 0);
+            } else {
+                noteIn(s, "req", r, convOfMsg(s, mb.msg));
+            }
+            return true;
+        },
+        .mcp => |r| {
+            // Upsert this server's discovered tools ("[]" on failure
+            // clears stale entries).
+            var found = false;
+            for (s.deps.mcp_tools.items) |*mt| {
+                if (std.mem.eql(u8, mt.server, r.server)) {
+                    state.freeStr(g, mt.tools_json);
+                    mt.tools_json = state.dupe(g, r.tools_json);
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                s.deps.mcp_tools.append(g, .{
+                    .server = state.dupe(g, r.server),
+                    .tools_json = state.dupe(g, r.tools_json),
+                }) catch @panic("OOM");
+            }
+            noteFmtIn(s, "mcp", "{s}: {s}", .{ r.server, r.detail }, 0);
+            s.deps.mcp_status.kind = if (r.ok) .ok else .err;
+            const t = std.fmt.allocPrint(g, "{s}: {s}", .{ r.server, r.detail }) catch return true;
+            defer g.free(t);
+            state.setStr(g, &s.deps.mcp_status.text, t);
+            return true;
+        },
+        .mcp_call => |r| {
+            if (r.conv >= s.deps.convs.items.len) return false;
+            const conv = s.deps.convs.items[r.conv];
+            if (r.msg >= conv.msgs.items.len) return false;
+            const am = conv.msgs.items[r.msg];
+            if (r.call >= am.calls.items.len) return false;
+            const c = &am.calls.items[r.call];
+            if (c.state != .running) return false; // resolved meanwhile
+            if (c.result) |old| state.freeStr(g, old);
+            c.result = state.dupe(g, r.text);
+            c.state = if (r.ok) .done else .failed;
+            noteFmtIn(s, "mcp", "{s} → {s}", .{ c.name, r.text }, @intFromPtr(conv));
+            var pending = false;
+            for (am.calls.items) |cc| {
+                if (cc.state == .pending or cc.state == .running) pending = true;
+            }
+            if (!pending) maybeContinue(s, am);
             return true;
         },
         .models => |ids| {
@@ -862,8 +1198,8 @@ fn applyEv(s: *Session, mb: *state.Mailbox, ev: state.Ev) bool {
             endpointFmt(s, .err, "{s}", .{e});
             return true;
         },
-        // .raw/.req/.models returned early above — unreachable here.
-        .raw, .req, .models => unreachable,
+        // .raw/.req/.models/.mcp/.mcp_call returned early above.
+        .raw, .req, .models, .mcp, .mcp_call => unreachable,
     }
 }
 
@@ -938,4 +1274,21 @@ test "smoke: doSend appends user msg and queues while streaming" {
     mb.workerDone();
     mb.close();
     s.deps.mailbox = null;
+}
+
+test "toolsPayload merges user defs and mcp tools" {
+    const gpa = std.testing.allocator;
+    const s = Session.create(gpa, std.testing.io);
+    defer s.deinit();
+    s.deps.cfg.tool_mode = .auto;
+    // mcp discovery result shape
+    s.deps.mcp_tools.append(gpa, .{
+        .server = state.dupe(gpa, "mock"),
+        .tools_json = state.dupe(gpa, "[{\"type\":\"function\",\"function\":{\"name\":\"mcp__mock__echo_mcp\"}}]"),
+    }) catch @panic("OOM");
+    const tp = toolsPayload(s);
+    defer if (tp.len != 0) gpa.free(tp);
+    try std.testing.expect(std.mem.indexOf(u8, tp, "mcp__mock__echo_mcp") != null);
+    try std.testing.expect(std.mem.startsWith(u8, tp, "["));
+    try std.testing.expect(std.mem.endsWith(u8, tp, "]"));
 }
